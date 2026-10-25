@@ -1,0 +1,11 @@
+Python 3.11.14 (conda-forge)
+
+mne==1.11.0
+numpy==2.3.5
+pandas==3.0.0
+scipy==1.17.0
+matplotlib==3.10.8
+ipykernel==7.1.0
+
+NerMI: not installed in this environment
+psychological_monitoring: not installed in this environment

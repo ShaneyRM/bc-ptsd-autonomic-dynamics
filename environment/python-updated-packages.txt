@@ -1,0 +1,14 @@
+Python 3.13.2 (Anaconda)
+
+numpy==2.2.5
+pandas==2.2.3
+scipy==1.15.2
+matplotlib==3.10.1
+seaborn==0.13.2
+ipykernel==6.29.5
+
+mne: not installed in this environment
+
+Author-controlled proprietary packages (versions observed locally; not publicly distributed):
+- NerMI: 0.1.0
+- psychological_monitoring: 0.1.0

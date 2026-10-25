@@ -1,0 +1,10 @@
+R 4.4.3 (2025-02-28 ucrt)
+
+rmarkdown==2.29
+knitr==1.50
+tidyverse==2.0.0
+zoo==1.8-12
+mgcv==1.9-4
+lme4==1.1-35.5
+lmerTest==3.2-1
+readxl==1.4.5

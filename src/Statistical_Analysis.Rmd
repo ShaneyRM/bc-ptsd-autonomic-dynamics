@@ -1,0 +1,4764 @@
+---
+title: "Physiological and NerMI Analysis Report"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    theme: cosmo
+  word_document:
+    toc: true
+---
+
+
+This document reports the SAI/PAI and NerMI Valence/Motivation analyses. Statistical analysis code for SAI, PAI, Valence, and Motivation is embedded in this document. The only external dependencies are the input clinical/survey spreadsheets, physiological CSVs, and R packages. ECG preprocessing remains an upstream Python procedure. The report is organized by analytic stream and documents the sequence of models, summaries, screening analyses, and figures used to characterize treatment-related change and its relationship to clinical improvement.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "95%"
+)
+
+
+library(knitr)
+library(tidyverse)
+
+# BHI_INPUT_DIR must point to the private, authorized input dataset directory.
+# Do not distribute identifiable clinical spreadsheets with the Rmd.
+input_dir <- Sys.getenv("BHI_INPUT_DIR", unset = ".")
+required_inputs <- c("functional_cleaned_long.csv", "functional_cleaned_long_nermi.csv", "Participant data.xlsx", "Dataset for IES-R, STAI Y1 e 2, BDI.xlsx")
+missing_inputs <- required_inputs[!file.exists(file.path(input_dir, required_inputs))]
+if (length(missing_inputs)) stop("Required input files absent: ", paste(missing_inputs, collapse = ", "))
+
+
+clean_tbl <- function(df, digits = 3){
+  df %>%
+    mutate(across(where(is.numeric), ~ round(.x, digits)))
+}
+
+
+head_list <- function(x, n = 6){
+  x[seq_len(min(length(x), n))]
+}
+
+
+fmt_p <- function(x){
+  ifelse(is.na(x), NA_character_, ifelse(x < 0.001, "<0.001", sprintf("%.3f", x)))
+}
+
+
+htest_tbl <- function(x, label){
+  tibble(
+    test = label,
+    statistic = unname(x$statistic),
+    parameter = if(length(x$parameter)) unname(x$parameter) else NA_real_,
+    p_value = x$p.value
+  )
+}
+
+
+lm_coef_tbl <- function(mod){
+  if(is.null(mod)) return(tibble())
+  as.data.frame(summary(mod)$coefficients) %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble()
+}
+
+
+lm_anova_tbl <- function(mod){
+  if(is.null(mod)) return(tibble())
+  as.data.frame(anova(mod)) %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble()
+}
+
+
+phase_lmm_tbl <- function(model_results){
+  purrr::imap_dfr(model_results, function(measure_models, measure_name){
+    purrr::imap_dfr(measure_models, function(model_obj, summary_name){
+      as.data.frame(model_obj$anova) %>%
+        tibble::rownames_to_column("term") %>%
+        as_tibble() %>%
+        mutate(measure = measure_name, summary = summary_name, .before = 1)
+    })
+  })
+}
+
+
+gam_param_tbl <- function(mod){
+  as.data.frame(summary(mod)$p.table) %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble()
+}
+
+
+gam_smooth_tbl <- function(mod){
+  as.data.frame(summary(mod)$s.table) %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble()
+}
+
+
+bhi <- new.env(parent = globalenv())
+nermi <- new.env(parent = globalenv())
+```
+
+
+```{r source-bhi, include=FALSE, cache=FALSE, fig.show='hide'}
+evalq({
+
+
+# Pointwise 95% CI for the full four-trajectory DiD contrast.
+# Uses model coefficient covariance (not independent curve intervals).
+save_did_confidence_intervals <- function(model, grid, prefix) {
+  re <- vapply(model$smooth, function(s) if (inherits(s, "random.effect")) s$label else "", "")
+  X <- predict(model, newdata = grid, type = "lpmatrix", exclude = re[nzchar(re)])
+  V <- vcov(model)
+  b <- coef(model)
+  keys <- c("Interventi__T1", "Interventi__T0", "Controlli__T1", "Controlli__T0")
+  out <- list()
+  groups <- if ("measure" %in% names(grid)) as.character(grid$measure) else rep(prefix, nrow(grid))
+  for (m in unique(groups)) for (ph in unique(as.character(grid$phase))) {
+    rows <- which(groups == m & as.character(grid$phase) == ph)
+    for (tt in sort(unique(grid$time_norm[rows]))) {
+      ids <- rows[grid$time_norm[rows] == tt]
+      lookup <- paste(grid$condition[ids], grid$trial[ids], sep = "__")
+      if (length(ids) != 4L || !setequal(lookup, keys)) stop("Unexpected DiD prediction grid")
+      xx <- as.numeric(c(1, -1, -1, 1) %*% X[ids[match(keys, lookup)], , drop = FALSE])
+      fit <- sum(xx * b)
+      se <- sqrt(max(0, as.numeric(t(xx) %*% V %*% xx)))
+      out[[length(out) + 1L]] <- data.frame(measure=m, phase=ph, time_norm=tt,
+        DiD=fit, se=se, lower95=fit-1.9599639845*se, upper95=fit+1.9599639845*se)
+    }
+  }
+  result <- dplyr::bind_rows(out)
+  dir.create("manuscript_gamm_ci", recursive=TRUE, showWarnings=FALSE)
+  write.csv(result, file.path("manuscript_gamm_ci", paste0(prefix, "_did_ci.csv")), row.names=FALSE)
+  fig <- ggplot2::ggplot(result, ggplot2::aes(time_norm, DiD)) +
+    ggplot2::geom_hline(yintercept=0, linetype=2) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin=lower95, ymax=upper95), alpha=.2) +
+    ggplot2::geom_line() + ggplot2::facet_grid(measure ~ phase, scales="free_y") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(x="Normalized phase time", y="(EMDR T1-T0) - (TAU T1-T0)")
+  ggplot2::ggsave(file.path("manuscript_gamm_ci", paste0(prefix, "_did_ci.png")),
+     fig, width=11, height=if (length(unique(groups))>1) 7 else 4.5, dpi=300)
+  invisible(result)
+}
+
+
+# ANALYSIS INDEX
+# ANALYSIS 01: Separate GAMMs for SAI and PAI trajectories
+# ANALYSIS 02: Separate clinical prediction GAMMs for SAI and PAI trajectories
+# ANALYSIS 03: Clinical outcomes (CAPS change by group)
+# ANALYSIS 04: Transition-feature change scores and group / clinical associations
+# ANALYSIS 05: Phase-summary mixed models (condition * trial * phase)
+# ANALYSIS 06: Phase-specific T1 - T0 change scores vs CAPS
+# ANALYSIS 07: Phase-separated T1 - T0 curve plots
+# ANALYSIS 08: mLFPCA feature screening, CAPS regression, and reconstructed curves
+
+
+# =========================================================
+# PACKAGES
+# =========================================================
+pkgs <- c("tidyverse", "zoo", "mgcv", "lme4", "lmerTest", "readxl")
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if(length(to_install)) install.packages(to_install)
+
+
+library(tidyverse)
+library(zoo)
+library(mgcv)
+library(lme4)
+library(lmerTest)
+library(readxl)
+
+
+# =========================================================
+# FILES
+# =========================================================
+func_path <- file.path(input_dir, "functional_cleaned_long.csv")
+clin_path <- file.path(input_dir, "Participant data.xlsx")
+survey_path <- file.path(input_dir, "Dataset for IES-R, STAI Y1 e 2, BDI.xlsx")
+
+
+raw <- read_csv(func_path, show_col_types = FALSE)
+clin_raw <- read_excel(clin_path)
+survey_raw <- read_excel(survey_path)
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+n_grid <- 100
+roll_k <- 11
+phase_levels <- c("oc1", "script", "oc2")
+descriptive_plot_dir <- "SAI_PAI_descriptive_plots"
+moderation_plot_dir <- "SAI_PAI_moderation_plots"
+model_output_dir <- "SAI_PAI_model_outputs"
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+cohen_d <- function(x, y){
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+
+
+  if(length(x) < 2 || length(y) < 2) return(NA_real_)
+
+
+  s_pooled <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) /
+                     (length(x) + length(y) - 2))
+
+
+  if(!is.finite(s_pooled) || s_pooled == 0) return(NA_real_)
+  (mean(x) - mean(y)) / s_pooled
+}
+
+
+safe_median <- function(x){
+  if(all(!is.finite(x))) return(NA_real_)
+  median(x, na.rm = TRUE)
+}
+
+
+curve_auc <- function(x){
+  if(all(!is.finite(x))) return(NA_real_)
+  sum((head(x, -1) + tail(x, -1)) / 2, na.rm = TRUE)
+}
+
+
+curve_peak <- function(x){
+  if(all(!is.finite(x))) return(NA_real_)
+  max(x, na.rm = TRUE)
+}
+
+
+curve_trough <- function(x){
+  if(all(!is.finite(x))) return(NA_real_)
+  min(x, na.rm = TRUE)
+}
+
+
+curve_slope <- function(x){
+  if(sum(is.finite(x)) < 5) return(NA_real_)
+  tt <- seq_along(x)
+  coef(lm(x ~ tt))[2]
+}
+
+
+`%||%` <- function(x, y){
+  if(is.null(x)) y else x
+}
+
+
+coalesce_override <- function(base_df, override_df, by){
+  override_cols <- setdiff(names(override_df), by)
+
+
+  merged <- base_df %>%
+    full_join(override_df, by = by, suffix = c("", "_override"))
+
+
+  for(col in override_cols){
+    override_col <- paste0(col, "_override")
+    if(override_col %in% names(merged)){
+      merged[[col]] <- dplyr::coalesce(merged[[override_col]], merged[[col]])
+      merged[[override_col]] <- NULL
+    }
+  }
+
+
+  merged
+}
+
+
+safe_plot_name <- function(...){
+  name <- paste(..., sep = "_")
+  name <- gsub("[^A-Za-z0-9]+", "_", name)
+  name <- gsub("^_+|_+$", "", name)
+  tolower(name)
+}
+
+
+condition_display <- function(x){
+  factor(
+    dplyr::recode(
+      as.character(x),
+      "Controlli" = "TAU",
+      "Interventi" = "EMDR",
+      .default = as.character(x)
+    ),
+    levels = c("TAU", "EMDR")
+  )
+}
+
+
+condition_palette <- c("TAU" = "#4C78A8", "EMDR" = "#F58518")
+phase_labels <- c("oc1" = "OC1", "script" = "Script", "oc2" = "OC2")
+
+
+save_analysis_plot <- function(plot, file_stem, directory = descriptive_plot_dir,
+                               width = 12, height = 7){
+  dir.create(directory, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(directory, paste0(safe_plot_name(file_stem), ".png"))
+
+
+  ggsave(
+    filename = out_file,
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+
+
+  out_file
+}
+
+
+make_two_bin_breaks <- function(x){
+  rng <- range(x, na.rm = TRUE)
+  if(!all(is.finite(rng))){
+    return(c(-Inf, 0, Inf))
+  }
+  if(diff(rng) == 0){
+    rng <- rng + c(-0.5, 0.5)
+  }
+  seq(rng[1], rng[2], length.out = 3)
+}
+
+
+outcome_improvement_label <- function(x){
+  med <- median(x, na.rm = TRUE)
+  if_else(x <= med, "MoreImproved", "LessImproved")
+}
+
+
+save_moderation_plot <- function(plot, measure_name, outcome_name, plot_kind,
+                                 width = 12, height = 7){
+  dir.create(moderation_plot_dir, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(
+    moderation_plot_dir,
+    paste0(safe_plot_name(measure_name, outcome_name, plot_kind), ".png")
+  )
+
+
+  ggsave(
+    filename = out_file,
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+
+
+  out_file
+}
+
+
+save_print_output <- function(file_name, expr){
+  dir.create(model_output_dir, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(model_output_dir, paste0(safe_plot_name(file_name), ".txt"))
+  lines <- capture.output(eval(substitute(expr), parent.frame()))
+  writeLines(lines, out_file)
+  out_file
+}
+
+
+row_sum_cols <- function(df, cols){
+  cols <- intersect(cols, names(df))
+  if(!length(cols)) return(rep(NA_real_, nrow(df)))
+
+
+  mat <- df %>%
+    select(all_of(cols)) %>%
+    mutate(across(everything(), as.numeric)) %>%
+    as.matrix()
+
+
+  rowSums(mat, na.rm = FALSE)
+}
+
+
+ies_subscale_sum <- function(df, visit_prefix, items){
+  row_sum_cols(df, paste0(visit_prefix, items))
+}
+
+
+clinical_assoc_by_outcome <- function(df, outcomes, variables){
+  map2_dfr(outcomes$outcome, outcomes$label, function(outcome_name, outcome_label){
+    spearman_assoc_table(df, outcome = outcome_name, variables = variables) %>%
+      mutate(
+        outcome = outcome_name,
+        outcome_label = outcome_label,
+        .before = 1
+      )
+  })
+}
+
+
+run_clinical_change_summary <- function(clin_df, outcomes){
+  map2_dfr(outcomes$outcome, outcomes$label, function(outcome_name, outcome_label){
+    clin_df %>%
+      group_by(condition) %>%
+      summarise(
+        n = sum(is.finite(.data[[outcome_name]])),
+        mean_change = mean(.data[[outcome_name]], na.rm = TRUE),
+        median_change = median(.data[[outcome_name]], na.rm = TRUE),
+        sd = sd(.data[[outcome_name]], na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        outcome = outcome_name,
+        outcome_label = outcome_label,
+        .before = 1
+      )
+  })
+}
+
+
+run_clinical_change_tests <- function(clin_df, outcomes){
+  map2_dfr(outcomes$outcome, outcomes$label, function(outcome_name, outcome_label){
+    dsub <- clin_df %>%
+      select(condition, all_of(outcome_name)) %>%
+      filter(is.finite(.data[[outcome_name]]), !is.na(condition))
+
+
+    x <- dsub %>% filter(condition == "Interventi") %>% pull(all_of(outcome_name))
+    y <- dsub %>% filter(condition == "Controlli") %>% pull(all_of(outcome_name))
+
+
+    tt <- if(length(x) >= 2 && length(y) >= 2) t.test(x, y) else NULL
+    wt <- if(length(x) >= 1 && length(y) >= 1) wilcox.test(x, y, exact = FALSE) else NULL
+
+
+    bind_rows(
+      tibble(
+        outcome = outcome_name,
+        outcome_label = outcome_label,
+        test = "Welch t-test",
+        statistic = if(is.null(tt)) NA_real_ else unname(tt$statistic),
+        parameter = if(is.null(tt) || !length(tt$parameter)) NA_real_ else unname(tt$parameter),
+        p_value = if(is.null(tt)) NA_real_ else tt$p.value
+      ),
+      tibble(
+        outcome = outcome_name,
+        outcome_label = outcome_label,
+        test = "Wilcoxon rank-sum",
+        statistic = if(is.null(wt)) NA_real_ else unname(wt$statistic),
+        parameter = NA_real_,
+        p_value = if(is.null(wt)) NA_real_ else wt$p.value
+      )
+    )
+  })
+}
+
+
+fit_top_feature_model <- function(df, results_tbl, outcome_name, n_top = 4){
+  top_features <- results_tbl %>%
+    filter(outcome == outcome_name, is.finite(p_value)) %>%
+    slice_head(n = n_top) %>%
+    pull(variable)
+
+
+  if(!length(top_features)){
+    return(list(model = NULL, top_features = character()))
+  }
+
+
+  form_txt <- paste(
+    outcome_name,
+    "~ condition +",
+    paste(top_features, collapse = " + ")
+  )
+
+
+  list(
+    model = lm(as.formula(form_txt), data = df),
+    top_features = top_features
+  )
+}
+
+
+smooth_resample_phase <- function(df_phase, value_col, n_grid = 100, roll_k = 11){
+  y <- df_phase[[value_col]]
+  t <- df_phase$timestamps
+
+
+  keep <- is.finite(t) & is.finite(y)
+  t <- t[keep]
+  y <- y[keep]
+
+
+  if(length(y) < 5) return(rep(NA_real_, n_grid))
+
+
+  ord <- order(t)
+  t <- t[ord]
+  y <- y[ord]
+
+
+  t <- t - min(t, na.rm = TRUE)
+
+
+  y_sm <- zoo::rollmedian(y, k = roll_k, fill = NA, align = "center")
+  good <- is.finite(t) & is.finite(y_sm)
+
+
+  if(sum(good) < 5) return(rep(NA_real_, n_grid))
+
+
+  t2 <- t[good]
+  y2 <- y_sm[good]
+
+
+  if(max(t2) == min(t2)){
+    return(rep(median(y2, na.rm = TRUE), n_grid))
+  }
+
+
+  t2 <- (t2 - min(t2)) / (max(t2) - min(t2))
+  grid <- seq(0, 1, length.out = n_grid)
+
+
+  approx(x = t2, y = y2, xout = grid, rule = 2)$y
+}
+
+
+build_phase_curves <- function(data, value_col, n_grid = 100, roll_k = 11){
+  keys <- data %>%
+    distinct(participant, condition, trial, task) %>%
+    arrange(condition, participant, trial, task)
+
+
+  out_list <- vector("list", nrow(keys))
+
+
+  for(i in seq_len(nrow(keys))){
+    key <- keys[i, ]
+
+
+    g <- data %>%
+      filter(
+        participant == key$participant,
+        condition == key$condition,
+        trial == key$trial,
+        task == key$task
+      )
+
+
+    curve <- smooth_resample_phase(g, value_col, n_grid = n_grid, roll_k = roll_k)
+
+
+    out_list[[i]] <- tibble(
+      participant = key$participant,
+      condition = key$condition,
+      trial = key$trial,
+      phase = key$task
+    ) %>%
+      bind_cols(as_tibble_row(setNames(as.list(curve), paste0("t", seq_len(n_grid)))))
+  }
+
+
+  bind_rows(out_list)
+}
+
+
+make_long_phase_curve <- function(df, measure_name){
+  df %>%
+    pivot_longer(
+      cols = matches("^t[0-9]+$"),
+      names_to = "t_idx",
+      values_to = "value"
+    ) %>%
+    mutate(
+      t_idx = as.numeric(gsub("^t", "", t_idx)),
+      time_norm = (t_idx - 1) / (max(t_idx) - 1),
+      measure = measure_name
+    ) %>%
+    select(participant, condition, trial, phase, measure, time_norm, value)
+}
+
+
+prepare_gamm_phase_data <- function(phase_df, measure_name){
+  make_long_phase_curve(phase_df, measure_name) %>%
+    mutate(
+      condition = factor(condition, levels = c("Controlli", "Interventi")),
+      trial = factor(trial, levels = c("T0", "T1")),
+      phase = factor(phase, levels = phase_levels),
+      measure = factor(measure, levels = c("SAI", "PAI")),
+      subj = factor(participant),
+      subj_visit = factor(paste(participant, trial, sep = "__")),
+      subj_visit_phase = factor(paste(participant, trial, phase, sep = "__")),
+      curve_group = interaction(condition, trial, phase, drop = TRUE)
+    ) %>%
+    filter(is.finite(value), is.finite(time_norm))
+}
+
+
+build_gamm_prediction_grid <- function(long_df, n_time = 200){
+  pred_grid <- expand.grid(
+    time_norm = seq(0, 1, length.out = n_time),
+    condition = levels(long_df$condition),
+    trial = levels(long_df$trial),
+    phase = levels(long_df$phase)
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      measure = long_df$measure[1],
+      subj = long_df$subj[1],
+      subj_visit = long_df$subj_visit[1],
+      subj_visit_phase = long_df$subj_visit_phase[1],
+      curve_group = factor(
+        interaction(condition, trial, phase, drop = TRUE),
+        levels = levels(long_df$curve_group)
+      )
+    )
+
+
+  pred_grid
+}
+
+
+plot_gamm_fitted_trajectories <- function(pred_grid, measure_name){
+  plot_df <- pred_grid %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = fit, color = condition_label, linetype = trial)) +
+    geom_line(linewidth = 1.1) +
+    facet_wrap(~ phase, scales = "free_y", nrow = 1) +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(measure_name, "fitted trajectories by phase, condition, and visit"),
+      x = "Normalized time within phase",
+      y = paste(measure_name, "fitted value"),
+      color = "Group"
+    )
+}
+
+
+build_gamm_did_curves <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, phase, condition, trial, fit) %>%
+    mutate(ct = paste(condition, trial, sep = "__")) %>%
+    select(-condition, -trial) %>%
+    pivot_wider(names_from = ct, values_from = fit) %>%
+    mutate(DiD = (Interventi__T1 - Interventi__T0) - (Controlli__T1 - Controlli__T0))
+}
+
+
+plot_gamm_did_curves <- function(did_df, measure_name){
+  ggplot(did_df, aes(x = time_norm, y = DiD)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1) +
+    facet_wrap(~ phase, scales = "free_y", nrow = 1) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(measure_name, "trajectory difference-in-differences"),
+      x = "Normalized time within phase",
+      y = "(EMDR T1 - T0) - (TAU T1 - T0)"
+    )
+}
+
+
+build_gamm_within_condition_change <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, phase, condition, trial, fit) %>%
+    pivot_wider(
+      id_cols = c(time_norm, measure, phase, condition),
+      names_from = trial,
+      values_from = fit
+    ) %>%
+    mutate(change_T1_minus_T0 = T1 - T0)
+}
+
+
+plot_gamm_within_condition_change <- function(change_df, measure_name){
+  plot_df <- change_df %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = change_T1_minus_T0, color = condition_label)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1) +
+    facet_wrap(~ phase, scales = "free_y", nrow = 1) +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(measure_name, "within-condition change from T0 to T1"),
+      x = "Normalized time within phase",
+      y = "T1 - T0",
+      color = "Group"
+    )
+}
+
+
+fit_measure_gamm <- function(phase_df, measure_name, n_time = 200){
+  long_df <- prepare_gamm_phase_data(phase_df, measure_name)
+
+
+  model <- bam(
+    value ~ condition * trial * phase +
+      s(time_norm, by = curve_group, bs = "cr", k = 6) +
+      s(subj, bs = "re") +
+      s(subj_visit, bs = "re") +
+      s(subj_visit_phase, bs = "re"),
+    data = long_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+
+  pred_grid <- build_gamm_prediction_grid(long_df, n_time = n_time)
+  pred_grid$fit <- predict(model, newdata = pred_grid, type = "response")
+
+
+  did_df <- build_gamm_did_curves(pred_grid)
+  within_condition_df <- build_gamm_within_condition_change(pred_grid)
+
+
+  list(
+    long_df = long_df,
+    model = model,
+    pred_grid = pred_grid,
+    did_df = did_df,
+    within_condition_df = within_condition_df,
+    plots = list(
+      fitted_trajectories = plot_gamm_fitted_trajectories(pred_grid, measure_name),
+      difference_in_differences = plot_gamm_did_curves(did_df, measure_name),
+      within_condition_change = plot_gamm_within_condition_change(within_condition_df, measure_name)
+    )
+  )
+}
+
+
+build_clinical_prediction_grid <- function(long_df, probs = c(0.25, 0.75), n_time = 200,
+                                           bin_breaks = NULL){
+  clinical_levels <- quantile(long_df$clinical_c, probs = probs, na.rm = TRUE)
+  if(is.null(bin_breaks)){
+    bin_breaks <- make_two_bin_breaks(long_df$clinical_c)
+  }
+
+
+  pred_grid <- expand.grid(
+    time_norm = seq(0, 1, length.out = n_time),
+    condition = levels(long_df$condition),
+    trial = levels(long_df$trial),
+    phase = levels(long_df$phase),
+    clinical_c = clinical_levels
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      measure = long_df$measure[1],
+      subj = long_df$subj[1],
+      subj_visit = long_df$subj_visit[1],
+      subj_visit_phase = long_df$subj_visit_phase[1],
+      curve_group = factor(
+        interaction(condition, trial, phase, drop = TRUE),
+        levels = levels(long_df$curve_group)
+      ),
+      clinical_bin = cut(clinical_c, breaks = bin_breaks, include.lowest = TRUE),
+      clinical_curve_group = factor(
+        interaction(trial, phase, clinical_bin, drop = TRUE),
+        levels = levels(long_df$clinical_curve_group)
+      ),
+      Clinical_level = factor(
+        outcome_improvement_label(clinical_c),
+        levels = c("LessImproved", "MoreImproved")
+      )
+    )
+
+
+  pred_grid
+}
+
+
+plot_clinical_fitted_trajectories <- function(pred_grid, measure_name, outcome_label){
+  plot_df <- pred_grid %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = fit, color = condition_label, linetype = trial)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(Clinical_level ~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(measure_name, "fitted trajectories moderated by", outcome_label),
+      x = "Normalized time within phase",
+      y = paste(measure_name, "fitted value"),
+      color = "Group"
+    )
+}
+
+
+build_clinical_difference_curves <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, condition, trial, phase, Clinical_level, fit) %>%
+    pivot_wider(
+      id_cols = c(time_norm, measure, condition, trial, phase),
+      names_from = Clinical_level,
+      values_from = fit
+    ) %>%
+    mutate(Clinical_diff = MoreImproved - LessImproved) %>%
+    group_by(time_norm, measure, trial, phase) %>%
+    summarise(Clinical_diff = mean(Clinical_diff, na.rm = TRUE), .groups = "drop")
+}
+
+
+plot_clinical_difference_curves <- function(clinical_diff_df, measure_name, outcome_label){
+  ggplot(clinical_diff_df, aes(x = time_norm, y = Clinical_diff, linetype = trial)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1, color = "#2F2F2F") +
+    facet_wrap(~ phase, scales = "free_y", nrow = 1) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste(measure_name, "condition-adjusted trajectory differences by degree of", outcome_label),
+      x = "Normalized time within phase",
+      y = "MoreImproved - LessImproved"
+    )
+}
+
+
+fit_measure_clinical_prediction_gamm <- function(phase_df, clin, measure_name,
+                                                 outcome_name, outcome_label,
+                                                 probs = c(0.25, 0.75),
+                                                 n_time = 200){
+  long_df <- prepare_gamm_phase_data(phase_df, measure_name) %>%
+    left_join(
+      clin %>% select(participant, condition, all_of(outcome_name)),
+      by = c("participant", "condition")
+    ) %>%
+    rename(clinical_outcome = all_of(outcome_name)) %>%
+    filter(is.finite(clinical_outcome)) %>%
+    mutate(
+      clinical_c = as.numeric(scale(clinical_outcome, center = TRUE, scale = FALSE)),
+      clinical_bin = cut(clinical_c, breaks = make_two_bin_breaks(clinical_c), include.lowest = TRUE),
+      clinical_curve_group = interaction(trial, phase, clinical_bin, drop = TRUE)
+    )
+
+
+  clinical_bin_breaks <- make_two_bin_breaks(long_df$clinical_c)
+  long_df <- long_df %>%
+    mutate(
+      clinical_bin = cut(clinical_c, breaks = clinical_bin_breaks, include.lowest = TRUE),
+      clinical_curve_group = interaction(trial, phase, clinical_bin, drop = TRUE)
+    )
+
+
+  gamm_1 <- bam(
+    value ~
+      condition * trial * phase +
+      clinical_c * trial * phase +
+      s(time_norm, by = curve_group, bs = "cr", k = 6) +
+      s(subj, bs = "re") +
+      s(subj_visit, bs = "re") +
+      s(subj_visit_phase, bs = "re"),
+    data = long_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+
+  gamm_2 <- bam(
+    value ~
+      condition * trial * phase +
+      clinical_c * trial * phase +
+      s(time_norm, by = curve_group, bs = "cr", k = 6) +
+      s(time_norm, by = clinical_curve_group, bs = "cr", k = 6) +
+      s(subj, bs = "re") +
+      s(subj_visit, bs = "re") +
+      s(subj_visit_phase, bs = "re"),
+    data = long_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+
+  pred_grid <- build_clinical_prediction_grid(
+    long_df,
+    probs = probs,
+    n_time = n_time,
+    bin_breaks = clinical_bin_breaks
+  )
+  pred_grid$fit <- predict(gamm_2, newdata = pred_grid, type = "response")
+  diff_df <- build_clinical_difference_curves(pred_grid)
+
+
+  list(
+    measure = measure_name,
+    outcome = outcome_name,
+    outcome_label = outcome_label,
+    long_df = long_df,
+    gamm_1 = gamm_1,
+    gamm_2 = gamm_2,
+    pred_grid = pred_grid,
+    diff_df = diff_df,
+    plots = list(
+      fitted_trajectories = plot_clinical_fitted_trajectories(pred_grid, measure_name, outcome_label),
+      difference_curves = plot_clinical_difference_curves(diff_df, measure_name, outcome_label)
+    )
+  )
+}
+
+
+build_transition_features <- function(phase_df, n_grid = 100){
+  tcols <- paste0("t", seq_len(n_grid))
+
+
+  wide <- phase_df %>%
+    pivot_wider(
+      id_cols = c(participant, condition, trial),
+      names_from = phase,
+      values_from = all_of(tcols),
+      names_glue = "{phase}_{.value}"
+    )
+
+
+  rows <- vector("list", nrow(wide))
+
+
+  for(i in seq_len(nrow(wide))){
+    row <- wide[i, ]
+
+
+    c_oc1 <- as.numeric(row[paste0("oc1_", tcols)])
+    c_script <- as.numeric(row[paste0("script_", tcols)])
+    c_oc2 <- as.numeric(row[paste0("oc2_", tcols)])
+
+
+    if(any(!is.finite(c_oc1)) || any(!is.finite(c_script)) || any(!is.finite(c_oc2))){
+      next
+    }
+
+
+    med_oc1 <- safe_median(c_oc1)
+    med_script <- safe_median(c_script)
+    med_oc2 <- safe_median(c_oc2)
+
+
+    script_minus_baseline <- c_script - med_oc1
+    recovery_minus_script <- c_oc2 - med_script
+
+
+    rows[[i]] <- tibble(
+      participant = row$participant,
+      condition = row$condition,
+      trial = row$trial,
+      baseline = med_oc1,
+      script = med_script,
+      recovery_phase = med_oc2,
+      reactivity = med_script - med_oc1,
+      recovery = med_oc2 - med_script,
+      return_to_baseline = med_oc2 - med_oc1,
+      return_to_baseline_abs = abs(med_oc2 - med_oc1),
+      reactivity_auc = curve_auc(abs(script_minus_baseline)),
+      reactivity_peak = curve_peak(script_minus_baseline),
+      reactivity_trough = curve_trough(script_minus_baseline),
+      reactivity_slope = curve_slope(script_minus_baseline),
+      recovery_auc = curve_auc(abs(recovery_minus_script)),
+      recovery_peak = curve_peak(recovery_minus_script),
+      recovery_trough = curve_trough(recovery_minus_script),
+      recovery_slope = curve_slope(recovery_minus_script)
+    )
+  }
+
+
+  bind_rows(rows)
+}
+
+
+make_phase_summary <- function(phase_df){
+  phase_df %>%
+    rowwise() %>%
+    mutate(
+      phase_median = safe_median(c_across(matches("^t[0-9]+$"))),
+      phase_auc = curve_auc(c_across(matches("^t[0-9]+$"))),
+      phase_peak = curve_peak(c_across(matches("^t[0-9]+$"))),
+      phase_trough = curve_trough(c_across(matches("^t[0-9]+$"))),
+      phase_slope = curve_slope(c_across(matches("^t[0-9]+$")))
+    ) %>%
+    ungroup()
+}
+
+
+fit_phase_lmm <- function(df, outcome){
+  form <- as.formula(paste0(outcome, " ~ condition * trial * phase + (1|participant)"))
+  mod <- lmer(form, data = df, REML = TRUE)
+
+
+  list(
+    model = mod,
+    anova = anova(mod),
+    summary = summary(mod)
+  )
+}
+
+
+make_trial_change_scores <- function(df, id_cols){
+  value_cols <- setdiff(names(df), c(id_cols, "trial"))
+
+
+  wide <- df %>%
+    pivot_wider(
+      id_cols = all_of(id_cols),
+      names_from = trial,
+      values_from = all_of(value_cols)
+    )
+
+
+  trial_vars <- names(wide)[grepl("_(T0|T1)$", names(wide))]
+  base_vars <- unique(gsub("_(T0|T1)$", "", trial_vars))
+
+
+  for(v in base_vars){
+    c0 <- paste0(v, "_T0")
+    c1 <- paste0(v, "_T1")
+    if(all(c(c0, c1) %in% names(wide))){
+      wide[[paste0(v, "_change")]] <- wide[[c1]] - wide[[c0]]
+    }
+  }
+
+
+  wide
+}
+
+
+group_change_tests <- function(df, variables){
+  rows <- list()
+
+
+  for(v in variables){
+    dsub <- df %>%
+      select(condition, all_of(v)) %>%
+      filter(is.finite(.data[[v]]), !is.na(condition))
+
+
+    x <- dsub %>% filter(condition == "Interventi") %>% pull(all_of(v))
+    y <- dsub %>% filter(condition == "Controlli") %>% pull(all_of(v))
+
+
+    if(length(x) < 2 || length(y) < 2) next
+
+
+    tt <- t.test(x, y)
+
+
+    rows[[length(rows) + 1]] <- tibble(
+      variable = v,
+      interventi_n = length(x),
+      controlli_n = length(y),
+      interventi_mean = mean(x),
+      controlli_mean = mean(y),
+      t_stat = unname(tt$statistic),
+      p_value = tt$p.value,
+      cohens_d = cohen_d(x, y)
+    )
+  }
+
+
+  bind_rows(rows) %>% arrange(p_value)
+}
+
+
+spearman_assoc_table <- function(df, outcome, variables = NULL){
+  if(is.null(variables)){
+    variables <- names(df)
+  }
+
+
+  variables <- setdiff(variables, outcome)
+  rows <- list()
+
+
+  for(v in variables){
+    ok <- is.finite(df[[v]]) & is.finite(df[[outcome]])
+    if(sum(ok) < 6) next
+
+
+    ct <- suppressWarnings(cor.test(df[[v]][ok], df[[outcome]][ok], method = "spearman"))
+
+
+    rows[[length(rows) + 1]] <- tibble(
+      variable = v,
+      n = sum(ok),
+      rho = unname(ct$estimate),
+      p_value = ct$p.value
+    )
+  }
+
+
+  if(!length(rows)){
+    return(tibble(
+      variable = character(),
+      n = integer(),
+      rho = numeric(),
+      p_value = numeric()
+    ))
+  }
+
+
+  bind_rows(rows) %>% arrange(p_value)
+}
+
+
+build_phase_change_curves <- function(phase_df, n_grid = 100){
+  tcols <- paste0("t", seq_len(n_grid))
+
+
+  wide <- phase_df %>%
+    pivot_wider(
+      id_cols = c(participant, condition, phase),
+      names_from = trial,
+      values_from = all_of(tcols)
+    )
+
+
+  rows <- vector("list", nrow(wide))
+
+
+  for(i in seq_len(nrow(wide))){
+    row <- wide[i, ]
+    x0 <- as.numeric(row[paste0(tcols, "_T0")])
+    x1 <- as.numeric(row[paste0(tcols, "_T1")])
+
+
+    if(any(!is.finite(x0)) || any(!is.finite(x1))) next
+
+
+    rows[[i]] <- tibble(
+      participant = row$participant,
+      condition = row$condition,
+      phase = row$phase
+    ) %>%
+      bind_cols(as_tibble_row(setNames(as.list(x1 - x0), tcols)))
+  }
+
+
+  bind_rows(rows)
+}
+
+
+plot_phase_change_curves <- function(change_df, title_txt, ylab_txt){
+  long <- change_df %>%
+    pivot_longer(
+      cols = matches("^t[0-9]+$"),
+      names_to = "idx",
+      values_to = "value"
+    ) %>%
+    mutate(idx = as.numeric(gsub("^t", "", idx))) %>%
+    group_by(condition, phase, idx) %>%
+    summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    group_by(condition, phase) %>%
+    mutate(time_norm = seq(0, 1, length.out = n())) %>%
+    ungroup()
+
+
+  long <- long %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(long, aes(x = time_norm, y = value, color = condition_label)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.35) +
+    geom_line(linewidth = 1.1) +
+    facet_wrap(~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(title = title_txt, x = "Normalized time", y = ylab_txt, color = "Group")
+}
+
+
+plot_subject_phase_trajectories <- function(phase_df, variable_label, ylab_txt = NULL){
+  ylab_txt <- ylab_txt %||% paste(variable_label, "value")
+  panel_levels <- tidyr::expand_grid(
+    condition_label = factor(c("TAU", "EMDR"), levels = c("TAU", "EMDR")),
+    trial = factor(c("T0", "T1"), levels = c("T0", "T1")),
+    phase = factor(phase_levels, levels = phase_levels)
+  ) %>%
+    mutate(
+      phase_label = unname(phase_labels[as.character(phase)]),
+      panel_label = paste(condition_label, trial, phase_label, sep = " - ")
+    ) %>%
+    pull(panel_label)
+
+
+  long <- phase_df %>%
+    pivot_longer(
+      cols = matches("^t[0-9]+$"),
+      names_to = "idx",
+      values_to = "value"
+    ) %>%
+    mutate(
+      idx = as.numeric(gsub("^t", "", idx)),
+      time_norm = (idx - min(idx, na.rm = TRUE)) /
+        (max(idx, na.rm = TRUE) - min(idx, na.rm = TRUE)),
+      condition_label = condition_display(condition),
+      trial = factor(trial, levels = c("T0", "T1")),
+      phase = factor(phase, levels = phase_levels),
+      phase_label = unname(phase_labels[as.character(phase)]),
+      panel_label = factor(
+        paste(condition_label, trial, phase_label, sep = " - "),
+        levels = panel_levels
+      )
+    ) %>%
+    filter(is.finite(time_norm), is.finite(value))
+
+
+  mean_df <- long %>%
+    group_by(condition_label, trial, phase, panel_label, time_norm) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+
+  ggplot(long, aes(x = time_norm, y = value)) +
+    geom_line(
+      aes(group = participant),
+      color = "#8C9AA6",
+      alpha = 0.22,
+      linewidth = 0.35
+    ) +
+    geom_line(
+      data = mean_df,
+      aes(y = mean_value, color = condition_label, group = interaction(condition_label, trial, phase)),
+      linewidth = 1.25
+    ) +
+    facet_wrap(~ panel_label, ncol = 3, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = paste(variable_label, "subject-level trajectories by group, visit, and phase"),
+      subtitle = "Thin lines are participants; thick lines are group means.",
+      x = "Normalized time within phase",
+      y = ylab_txt,
+      color = "Group mean"
+    )
+}
+
+
+plot_individual_clinical_scatter <- function(df, clinical_var, feature_var,
+                                             clinical_label = NULL,
+                                             feature_label = NULL,
+                                             title_txt = NULL){
+  clinical_label <- clinical_label %||% paste(clinical_var, "(T1 - T0)")
+  feature_label <- feature_label %||% feature_var
+  title_txt <- title_txt %||% paste(feature_label, "vs", clinical_label)
+
+
+  d <- df %>%
+    select(participant, condition, all_of(c(clinical_var, feature_var))) %>%
+    filter(is.finite(.data[[clinical_var]]), is.finite(.data[[feature_var]])) %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  if(nrow(d) >= 3){
+    ct <- suppressWarnings(cor.test(d[[clinical_var]], d[[feature_var]], method = "spearman", exact = FALSE))
+    stat_label <- paste0(
+      "Spearman rho = ", sprintf("%.2f", unname(ct$estimate)),
+      "\np = ", format.pval(ct$p.value, digits = 2, eps = 0.001),
+      "\nn = ", nrow(d)
+    )
+  } else {
+    stat_label <- paste0("n = ", nrow(d))
+  }
+
+
+  ggplot(d, aes(x = .data[[clinical_var]], y = .data[[feature_var]], color = condition_label)) +
+    geom_hline(yintercept = 0, linewidth = 0.35, color = "#2F7FD0", alpha = 0.7) +
+    geom_vline(xintercept = 0, linewidth = 0.35, color = "#2F7FD0", alpha = 0.7) +
+    geom_point(size = 2.7, alpha = 0.9) +
+    geom_smooth(aes(group = 1), method = "lm", se = FALSE, color = "#2F2F2F",
+                linewidth = 0.8, linetype = "dashed") +
+    annotate("label", x = Inf, y = Inf, hjust = 1.04, vjust = 1.15,
+             label = stat_label, size = 3.6, label.size = 0.2, alpha = 0.9) +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = title_txt,
+      x = paste0(clinical_label, " (T1 - T0; lower = more improvement)"),
+      y = feature_label,
+      color = "Group"
+    )
+}
+
+
+# =========================================================
+# CLEAN DATA
+# =========================================================
+dat <- raw %>%
+  mutate(
+    participant = str_squish(as.character(participant)),
+    condition = factor(condition, levels = c("Controlli", "Interventi")),
+    trial = factor(toupper(as.character(trial)), levels = c("T0", "T1")),
+    task = factor(tolower(as.character(task)), levels = phase_levels),
+    timestamps = as.numeric(timestamps),
+    SAI_clean = as.numeric(SAI_clean),
+    PAI_clean = as.numeric(PAI_clean)
+  ) %>%
+  filter(task %in% phase_levels)
+
+
+cond_check <- dat %>%
+  distinct(participant, condition) %>%
+  count(participant, name = "n_conditions") %>%
+  filter(n_conditions > 1)
+
+
+if(nrow(cond_check) > 0){
+  warning("Some participants appear in more than one condition. Resolve this before trusting the results.")
+}
+
+
+paired_participants <- dat %>%
+  distinct(participant, condition, trial) %>%
+  count(participant, condition, name = "n_trials") %>%
+  filter(n_trials == 2) %>%
+  select(participant, condition)
+
+
+survey_cols <- c(
+  "PZ",
+  grep("^(IEST|STAY1T|STAY2T|BDIT)", names(survey_raw), value = TRUE)
+)
+
+
+clin_source <- coalesce_override(
+  clin_raw,
+  survey_raw %>% select(any_of(survey_cols)),
+  by = "PZ"
+)
+
+
+clin <- clin_source %>%
+  rename(participant = PZ) %>%
+  mutate(
+    participant = str_squish(as.character(participant)),
+    IES_T0 = as.numeric(IEST0TOT),
+    IES_T1 = as.numeric(IEST1TOT),
+    IES_change = IES_T1 - IES_T0,
+    IES_intrusion_T0 = ies_subscale_sum(., "IEST0", c(1, 2, 3, 6, 9, 14, 16, 20)),
+    IES_intrusion_T1 = ies_subscale_sum(., "IEST1", c(1, 2, 3, 6, 9, 14, 16, 20)),
+    IES_intrusion_change = IES_intrusion_T1 - IES_intrusion_T0,
+    IES_avoidance_T0 = ies_subscale_sum(., "IEST0", c(5, 7, 8, 11, 12, 13, 17, 22)),
+    IES_avoidance_T1 = ies_subscale_sum(., "IEST1", c(5, 7, 8, 11, 12, 13, 17, 22)),
+    IES_avoidance_change = IES_avoidance_T1 - IES_avoidance_T0,
+    IES_hyperarousal_T0 = ies_subscale_sum(., "IEST0", c(4, 10, 15, 18, 19, 21)),
+    IES_hyperarousal_T1 = ies_subscale_sum(., "IEST1", c(4, 10, 15, 18, 19, 21)),
+    IES_hyperarousal_change = IES_hyperarousal_T1 - IES_hyperarousal_T0,
+    STAI_Y1_T0 = as.numeric(STAY1T0TOT),
+    STAI_Y1_T1 = as.numeric(STAY1T1TOT),
+    STAI_Y1_change = STAI_Y1_T1 - STAI_Y1_T0,
+    STAI_Y2_T0 = as.numeric(STAY2T0TOT),
+    STAI_Y2_T1 = as.numeric(STAY2T1TOT),
+    STAI_Y2_change = STAI_Y2_T1 - STAI_Y2_T0,
+    CAPS_T0 = as.numeric(CAPST0TOT),
+    CAPS_T1 = as.numeric(CAPST1TOT),
+    CAPS_change = CAPS_T1 - CAPS_T0
+  ) %>%
+  inner_join(paired_participants, by = "participant") %>%
+  select(
+    participant,
+    condition,
+    IES_T0,
+    IES_T1,
+    IES_change,
+    IES_intrusion_T0,
+    IES_intrusion_T1,
+    IES_intrusion_change,
+    IES_avoidance_T0,
+    IES_avoidance_T1,
+    IES_avoidance_change,
+    IES_hyperarousal_T0,
+    IES_hyperarousal_T1,
+    IES_hyperarousal_change,
+    STAI_Y1_T0,
+    STAI_Y1_T1,
+    STAI_Y1_change,
+    STAI_Y2_T0,
+    STAI_Y2_T1,
+    STAI_Y2_change,
+    CAPS_T0,
+    CAPS_T1,
+    CAPS_change
+  )
+
+
+clinical_change_targets <- tribble(
+  ~outcome, ~label,
+  "CAPS_change", "CAPS change",
+  "IES_change", "IES-R total change",
+  "IES_intrusion_change", "IES-R intrusion change",
+  "IES_avoidance_change", "IES-R avoidance change",
+  "IES_hyperarousal_change", "IES-R hyperarousal change",
+  "STAI_Y1_change", "STAI Y1 change",
+  "STAI_Y2_change", "STAI Y2 change"
+)
+
+
+clinical_change_cols <- clinical_change_targets$outcome
+
+
+analysis_ids <- clin %>% distinct(participant)
+
+
+dat <- dat %>%
+  semi_join(analysis_ids, by = "participant")
+
+
+message("Analysis sample: ", n_distinct(dat$participant), " participants with paired T0/T1 physiology and clinical data.")
+
+
+phase_curves <- list(
+  SAI = build_phase_curves(dat, "SAI_clean", n_grid = n_grid, roll_k = roll_k),
+  PAI = build_phase_curves(dat, "PAI_clean", n_grid = n_grid, roll_k = roll_k)
+)
+
+
+subject_trajectory_plots <- list(
+  SAI = plot_subject_phase_trajectories(phase_curves$SAI, "SAI", "SAI value"),
+  PAI = plot_subject_phase_trajectories(phase_curves$PAI, "PAI", "PAI value")
+)
+
+
+subject_trajectory_plot_files <- imap_chr(
+  subject_trajectory_plots,
+  ~ save_analysis_plot(
+    .x,
+    paste(.y, "subject trajectories", sep = "_"),
+    directory = descriptive_plot_dir,
+    width = 14,
+    height = 10
+  )
+)
+
+
+phase_summaries <- map(phase_curves, make_phase_summary)
+transition_features <- map(phase_curves, build_transition_features, n_grid = n_grid)
+
+
+# =========================================================
+# ANALYSIS 01: SEPARATE GAMMS
+# =========================================================
+gamm_results <- imap(phase_curves, ~ fit_measure_gamm(.x, .y, n_time = 200))
+# Generate DiD confidence intervals directly; no source() or separate script needed.
+for (measure_name in names(gamm_results)) {
+  res <- gamm_results[[measure_name]]
+  save_did_confidence_intervals(res$model, res$pred_grid, tolower(measure_name))
+}
+
+
+gamm_output_files <- imap_dfr(
+  gamm_results,
+  function(res, measure_name){
+    output_file <- save_print_output(paste(measure_name, "GAMM", sep = "_"), {
+      cat("\n==== ", measure_name, " GAMM ====\n", sep = "")
+      print(summary(res$model))
+      print(anova(res$model))
+    })
+
+
+    tibble(
+      measure = measure_name,
+      model = "GAMM",
+      file = output_file
+    )
+  }
+)
+
+
+message("Saved SAI/PAI GAMM outputs: ", paste(gamm_output_files$file, collapse = "; "))
+
+
+gamm_plot_files <- imap_dfr(
+  gamm_results,
+  function(res, measure_name){
+    tibble(
+      measure = measure_name,
+      plot_type = names(res$plots),
+      file = imap_chr(
+        res$plots,
+        ~ save_analysis_plot(
+          .x,
+          paste(measure_name, .y, sep = "_"),
+          directory = descriptive_plot_dir,
+          width = 11,
+          height = 5.5
+        )
+      )
+    )
+  }
+)
+
+
+walk(gamm_results, function(res){
+  print(res$plots$fitted_trajectories)
+  print(res$plots$difference_in_differences)
+  print(res$plots$within_condition_change)
+})
+
+
+# =========================================================
+# ANALYSIS 02: CLINICAL PREDICTION GAMMS
+# =========================================================
+clinical_prediction_results <- imap(
+  phase_curves,
+  function(phase_df, measure_name){
+    set_names(
+      map2(
+        clinical_change_targets$outcome,
+        clinical_change_targets$label,
+        ~ fit_measure_clinical_prediction_gamm(
+          phase_df,
+          clin,
+          measure_name = measure_name,
+          outcome_name = .x,
+          outcome_label = .y
+        )
+      ),
+      clinical_change_targets$outcome
+    )
+  }
+)
+
+
+clinical_prediction_output_files <- imap_dfr(
+  clinical_prediction_results,
+  function(measure_results, measure_name){
+    imap_dfr(
+      measure_results,
+      function(res, outcome_name){
+        message(
+          measure_name,
+          " ",
+          res$outcome_label,
+          " clinical prediction GAMM sample: ",
+          n_distinct(res$long_df$participant),
+          " participants."
+        )
+
+
+        gamm_1_output_file <- save_print_output(paste(measure_name, outcome_name, "clinical_GAMM_1", sep = "_"), {
+          cat("\n==== ", measure_name, " ", res$outcome_label, " clinical GAMM 1 ====\n", sep = "")
+          print(summary(res$gamm_1))
+          print(anova(res$gamm_1))
+        })
+
+
+        gamm_2_output_file <- save_print_output(paste(measure_name, outcome_name, "clinical_GAMM_2", sep = "_"), {
+          cat("\n==== ", measure_name, " ", res$outcome_label, " clinical GAMM 2 ====\n", sep = "")
+          print(summary(res$gamm_2))
+          print(anova(res$gamm_2))
+        })
+
+
+        tibble(
+          measure = measure_name,
+          outcome = outcome_name,
+          outcome_label = res$outcome_label,
+          model = c("GAMM 1", "GAMM 2"),
+          file = c(gamm_1_output_file, gamm_2_output_file)
+        )
+      }
+    )
+  }
+)
+
+
+message("Saved clinical prediction GAMM outputs: ", paste(clinical_prediction_output_files$file, collapse = "; "))
+
+
+clinical_prediction_plot_files <- imap_dfr(
+  clinical_prediction_results,
+  function(measure_results, measure_name){
+    imap_dfr(
+      measure_results,
+      function(res, outcome_name){
+        tibble(
+          measure = measure_name,
+          outcome = outcome_name,
+          outcome_label = res$outcome_label,
+          plot_type = names(res$plots),
+          file = imap_chr(
+            res$plots,
+            ~ save_moderation_plot(
+              .x,
+              measure_name,
+              outcome_name,
+              .y
+            )
+          )
+        )
+      }
+    )
+  }
+)
+
+
+walk(clinical_prediction_results, function(measure_results){
+  walk(measure_results, function(res){
+    print(res$plots$fitted_trajectories)
+    print(res$plots$difference_curves)
+  })
+})
+
+
+# =========================================================
+# ANALYSIS 03: CLINICAL OUTCOMES
+# =========================================================
+clinical_outcomes <- list(
+  summary = clin %>%
+    group_by(condition) %>%
+    summarise(
+      n = n(),
+      mean_change = mean(CAPS_change, na.rm = TRUE),
+      median_change = median(CAPS_change, na.rm = TRUE),
+      sd = sd(CAPS_change, na.rm = TRUE),
+      .groups = "drop"
+    ),
+  welch_t = t.test(CAPS_change ~ condition, data = clin),
+  wilcox = wilcox.test(CAPS_change ~ condition, data = clin, exact = FALSE)
+)
+
+
+cat("\n==== Clinical outcomes ====\n")
+print(clinical_outcomes$summary)
+print(clinical_outcomes$welch_t)
+print(clinical_outcomes$wilcox)
+
+
+clinical_change_outcomes <- list(
+  summary = run_clinical_change_summary(clin, clinical_change_targets),
+  tests = run_clinical_change_tests(clin, clinical_change_targets)
+)
+
+
+clinical_output_files <- tibble(
+  analysis = c("clinical_outcomes", "clinical_change_outcomes"),
+  file = c(
+    save_print_output("clinical_outcomes", {
+      cat("\n==== Clinical outcomes ====\n")
+      print(clinical_outcomes$summary)
+      print(clinical_outcomes$welch_t)
+      print(clinical_outcomes$wilcox)
+    }),
+    save_print_output("clinical_change_outcomes", {
+      cat("\n==== Clinical change outcomes ====\n")
+      print(clinical_change_outcomes$summary, n = Inf, width = Inf)
+      print(clinical_change_outcomes$tests, n = Inf, width = Inf)
+    })
+  )
+)
+
+
+cat("\n==== Clinical change outcomes ====\n")
+print(clinical_change_outcomes$summary)
+print(clinical_change_outcomes$tests)
+
+
+# =========================================================
+# ANALYSIS 04: TRANSITION-FEATURE CHANGE SCORES
+# =========================================================
+transition_change_tables <- imap(
+  transition_features,
+  ~ make_trial_change_scores(.x, id_cols = c("participant", "condition")) %>%
+    left_join(clin %>% select(participant, IES_T0, all_of(clinical_change_cols)), by = "participant")
+)
+
+
+transition_change_vars <- setdiff(
+  grep("_change$", names(transition_change_tables[[1]]), value = TRUE),
+  clinical_change_cols
+)
+
+
+transition_group_tests <- imap(
+  transition_change_tables,
+  ~ group_change_tests(.x, variables = c("reactivity_change", "recovery_change")) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+transition_caps_assoc <- imap(
+  transition_change_tables,
+  ~ spearman_assoc_table(
+    .x,
+    outcome = "CAPS_change",
+    variables = transition_change_vars
+  ) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+transition_ies_assoc <- imap(
+  transition_change_tables,
+  ~ spearman_assoc_table(
+    .x,
+    outcome = "IES_T0",
+    variables = transition_change_vars
+  ) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+transition_clinical_change_assoc <- imap(
+  transition_change_tables,
+  ~ clinical_assoc_by_outcome(.x, clinical_change_targets, transition_change_vars) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+cat("\n==== Transition-feature group comparisons ====\n")
+print(transition_group_tests)
+
+
+cat("\n==== Transition-feature change vs CAPS ====\n")
+print(transition_caps_assoc)
+
+
+cat("\n==== Transition-feature change vs IES T0 ====\n")
+print(transition_ies_assoc,n=30)
+
+
+cat("\n==== Transition-feature change vs clinical symptom change scores ====\n")
+print(transition_clinical_change_assoc, n=210)
+
+
+transition_clinical_scatter_specs <- transition_clinical_change_assoc %>%
+  filter(is.finite(p_value), p_value < 0.05) %>%
+  arrange(p_value)
+
+
+transition_clinical_scatter_plots <- pmap(
+  transition_clinical_scatter_specs,
+  function(measure, outcome, outcome_label, variable, n, rho, p_value){
+    plot_individual_clinical_scatter(
+      transition_change_tables[[measure]],
+      clinical_var = outcome,
+      feature_var = variable,
+      clinical_label = outcome_label,
+      feature_label = paste(measure, variable),
+      title_txt = paste(measure, variable, "vs", outcome_label)
+    )
+  }
+)
+
+
+names(transition_clinical_scatter_plots) <- pmap_chr(
+  transition_clinical_scatter_specs,
+  function(measure, outcome, outcome_label, variable, n, rho, p_value){
+    safe_plot_name("transition_scatter", measure, outcome, variable)
+  }
+)
+
+
+transition_clinical_scatter_files <- imap_chr(
+  transition_clinical_scatter_plots,
+  ~ save_analysis_plot(
+    .x,
+    .y,
+    directory = file.path(descriptive_plot_dir, "clinical_scatterplots"),
+    width = 7,
+    height = 5.5
+  )
+)
+
+
+transition_output_files <- tibble(
+  analysis = c(
+    "transition_group_tests",
+    "transition_caps_assoc",
+    "transition_ies_assoc",
+    "transition_clinical_change_assoc"
+  ),
+  file = c(
+    save_print_output("transition_group_tests", {
+      cat("\n==== Transition-feature group comparisons ====\n")
+      print(transition_group_tests, n = Inf, width = Inf)
+    }),
+    save_print_output("transition_caps_assoc", {
+      cat("\n==== Transition-feature change vs CAPS ====\n")
+      print(transition_caps_assoc, n = Inf, width = Inf)
+    }),
+    save_print_output("transition_ies_assoc", {
+      cat("\n==== Transition-feature change vs IES T0 ====\n")
+      print(transition_ies_assoc, n = Inf, width = Inf)
+    }),
+    save_print_output("transition_clinical_change_assoc", {
+      cat("\n==== Transition-feature change vs clinical symptom change scores ====\n")
+      print(transition_clinical_change_assoc, n = Inf, width = Inf)
+    })
+  )
+)
+
+
+# =========================================================
+# ANALYSIS 05: PHASE-SUMMARY MIXED MODELS
+# =========================================================
+phase_model_results <- imap(
+  phase_summaries,
+  ~ list(
+    median = fit_phase_lmm(.x, "phase_median"),
+    auc = fit_phase_lmm(.x, "phase_auc"),
+    peak = fit_phase_lmm(.x, "phase_peak"),
+    trough = fit_phase_lmm(.x, "phase_trough"),
+    slope = fit_phase_lmm(.x, "phase_slope")
+  )
+)
+
+
+phase_model_output_files <- imap_dfr(
+  phase_model_results,
+  function(measure_models, measure_name){
+    imap_dfr(
+      measure_models,
+      function(model_res, model_name){
+        output_file <- save_print_output(paste(measure_name, model_name, "phase_lmm", sep = "_"), {
+          cat("\n==== ", measure_name, " ", model_name, " phase-level mixed model ====\n", sep = "")
+          print(model_res$summary)
+          print(model_res$anova)
+        })
+
+
+        tibble(
+          measure = measure_name,
+          model = model_name,
+          file = output_file
+        )
+      }
+    )
+  }
+)
+
+
+for(measure_name in names(phase_model_results)){
+  cat("\n====", measure_name, "phase-level mixed models ====\n")
+  for(model_name in names(phase_model_results[[measure_name]])){
+    cat("\n", model_name, "\n")
+    print(phase_model_results[[measure_name]][[model_name]]$anova)
+  }
+}
+
+
+# =========================================================
+# ANALYSIS 06: PHASE-SPECIFIC CHANGE SCORES VS CAPS
+# =========================================================
+phase_change_tables <- imap(
+  phase_summaries,
+  ~ make_trial_change_scores(.x, id_cols = c("participant", "condition", "phase")) %>%
+    left_join(clin %>% select(participant, all_of(clinical_change_cols)), by = "participant")
+)
+
+
+phase_change_vars <- setdiff(
+  grep("_change$", names(phase_change_tables[[1]]), value = TRUE),
+  clinical_change_cols
+)
+
+
+phase_caps_results <- imap(
+  phase_change_tables,
+  ~ map_dfr(unique(.x$phase), function(ph){
+    dph <- .x %>% filter(phase == ph)
+    spearman_assoc_table(
+      dph,
+      outcome = "CAPS_change",
+      variables = phase_change_vars
+    ) %>%
+      mutate(phase = ph) %>%
+      relocate(phase)
+  }) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+phase_clinical_change_results <- imap(
+  phase_change_tables,
+  ~ map_dfr(unique(.x$phase), function(ph){
+    dph <- .x %>% filter(phase == ph)
+    clinical_assoc_by_outcome(dph, clinical_change_targets, phase_change_vars) %>%
+      mutate(phase = ph) %>%
+      relocate(phase)
+  }) %>%
+    mutate(measure = .y) %>%
+    relocate(measure)
+) %>%
+  bind_rows()
+
+
+cat("\n==== Phase-specific change vs CAPS ====\n")
+print(phase_caps_results)
+print(phase_caps_results, n = Inf)
+
+
+cat("\n==== Phase-specific change vs clinical symptom change scores ====\n")
+print(phase_clinical_change_results)
+print(phase_clinical_change_results, n = Inf)
+
+
+phase_change_output_files <- tibble(
+  analysis = c("phase_caps_results", "phase_clinical_change_results"),
+  file = c(
+    save_print_output("phase_caps_results", {
+      cat("\n==== Phase-specific change vs CAPS ====\n")
+      print(phase_caps_results, n = Inf, width = Inf)
+    }),
+    save_print_output("phase_clinical_change_results", {
+      cat("\n==== Phase-specific change vs clinical symptom change scores ====\n")
+      print(phase_clinical_change_results, n = Inf, width = Inf)
+    })
+  )
+)
+
+
+# =========================================================
+# ANALYSIS 07: PHASE-SEPARATED T1 - T0 CURVE PLOTS
+# =========================================================
+phase_change_curves <- map(phase_curves, build_phase_change_curves, n_grid = n_grid)
+
+
+phase_change_plots <- imap(
+  phase_change_curves,
+  ~ plot_phase_change_curves(
+    .x,
+    title_txt = paste0(.y, " phase-separated T1 - T0 curves"),
+    ylab_txt = paste0(.y, " T1 - T0")
+  )
+)
+
+
+phase_change_plot_files <- imap_chr(
+  phase_change_plots,
+  ~ save_analysis_plot(
+    .x,
+    paste(.y, "phase separated t1 minus t0 curves", sep = "_"),
+    directory = descriptive_plot_dir,
+    width = 9,
+    height = 5
+  )
+)
+
+
+windows(width = 7, height = 4)
+
+
+print(phase_change_plots$SAI)
+print(phase_change_plots$PAI)
+
+
+# =========================================================
+# ANALYSIS 08: mLFPCA FEATURE SCREENING, CAPS REGRESSION, AND RECONSTRUCTED CURVES
+# =========================================================
+time_cols <- paste0("t", seq_len(n_grid))
+
+
+choose_ncomp <- function(sdev, pve = 0.90, max_n = 3){
+  if(length(sdev) == 0 || all(!is.finite(sdev))) return(0L)
+
+
+  total_var <- sum(sdev^2, na.rm = TRUE)
+  if(!is.finite(total_var) || total_var <= 0) return(0L)
+
+
+  var_expl <- sdev^2 / total_var
+  cumvar <- cumsum(var_expl)
+  k <- which(cumvar >= pve)[1]
+
+
+  if(is.na(k)) k <- length(sdev)
+  as.integer(min(k, max_n))
+}
+
+
+run_multilevel_fpca_phase <- function(df_phase, measure_name, phase_name,
+                                      pve_between = 0.90,
+                                      pve_within = 0.90,
+                                      max_between = 2,
+                                      max_within = 2){
+  d <- df_phase %>%
+    filter(phase == phase_name) %>%
+    filter(if_all(all_of(time_cols), is.finite)) %>%
+    arrange(participant, trial)
+
+
+  if(nrow(d) < 4){
+    return(list(
+      measure = measure_name,
+      phase = phase_name,
+      mu = rep(NA_real_, length(time_cols)),
+      between_pca = NULL,
+      within_pca = NULL,
+      kb = 0L,
+      kw = 0L,
+      features = tibble(participant = character(), condition = factor())
+    ))
+  }
+
+
+  Y <- as.matrix(d[, time_cols])
+  cond_map <- d %>% distinct(participant, condition)
+
+
+  mu <- colMeans(Y, na.rm = TRUE)
+
+
+  subj_mean_df <- d %>%
+    group_by(participant) %>%
+    summarise(across(all_of(time_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+
+  Y_between <- as.matrix(subj_mean_df[, time_cols])
+  Y_between_centered <- sweep(Y_between, 2, mu, "-")
+
+
+  pca_between <- prcomp(Y_between_centered, center = FALSE, scale. = FALSE)
+  kb <- choose_ncomp(pca_between$sdev, pve = pve_between, max_n = max_between)
+
+
+  if(kb > 0){
+    between_scores <- as.data.frame(pca_between$x[, seq_len(kb), drop = FALSE])
+    names(between_scores) <- paste0(measure_name, "_", phase_name, "_bPC", seq_len(kb))
+    between_scores$participant <- subj_mean_df$participant
+  } else {
+    between_scores <- tibble(participant = subj_mean_df$participant)
+  }
+
+
+  subj_mean_map <- subj_mean_df %>%
+    rename_with(~ paste0(.x, "_subjmean"), all_of(time_cols))
+
+
+  d_with_means <- d %>%
+    left_join(subj_mean_map, by = "participant")
+
+
+  Y_within <- matrix(NA_real_, nrow = nrow(d_with_means), ncol = length(time_cols))
+  colnames(Y_within) <- time_cols
+
+
+  for(j in seq_along(time_cols)){
+    Y_within[, j] <- d_with_means[[time_cols[j]]] - d_with_means[[paste0(time_cols[j], "_subjmean")]]
+  }
+
+
+  complete_within <- complete.cases(Y_within)
+  Y_within <- Y_within[complete_within, , drop = FALSE]
+  within_meta <- d_with_means[complete_within, c("participant", "condition", "trial", "phase")]
+
+
+  if(nrow(Y_within) >= 4){
+    pca_within <- prcomp(Y_within, center = FALSE, scale. = FALSE)
+    kw <- choose_ncomp(pca_within$sdev, pve = pve_within, max_n = max_within)
+  } else {
+    pca_within <- NULL
+    kw <- 0L
+  }
+
+
+  if(kw > 0){
+    within_scores <- as.data.frame(pca_within$x[, seq_len(kw), drop = FALSE])
+    names(within_scores) <- paste0(measure_name, "_", phase_name, "_wPC", seq_len(kw))
+    within_scores <- bind_cols(within_meta, within_scores)
+
+
+    within_change <- within_scores %>%
+      pivot_wider(
+        id_cols = c(participant, condition, phase),
+        names_from = trial,
+        values_from = starts_with(paste0(measure_name, "_", phase_name, "_wPC"))
+      )
+
+
+    for(k in seq_len(kw)){
+      base <- paste0(measure_name, "_", phase_name, "_wPC", k)
+      c0 <- paste0(base, "_T0")
+      c1 <- paste0(base, "_T1")
+      if(all(c(c0, c1) %in% names(within_change))){
+        within_change[[paste0(base, "_change")]] <- within_change[[c1]] - within_change[[c0]]
+      }
+    }
+
+
+    within_change <- within_change %>%
+      select(participant, condition, ends_with("_change"))
+  } else {
+    within_change <- cond_map
+  }
+
+
+  features <- between_scores %>%
+    left_join(cond_map, by = "participant") %>%
+    left_join(within_change, by = c("participant", "condition"))
+
+
+  list(
+    measure = measure_name,
+    phase = phase_name,
+    mu = mu,
+    between_pca = pca_between,
+    within_pca = pca_within,
+    kb = kb,
+    kw = kw,
+    features = features
+  )
+}
+
+
+fpca_assoc_screen <- function(df, outcome, variables = NULL){
+  if(is.null(variables)){
+    variables <- names(df)
+  }
+
+
+  feat_cols <- setdiff(variables, c("participant", "condition", outcome))
+  spearman_assoc_table(df, outcome = outcome, variables = feat_cols)
+}
+
+
+plot_fpca_reconstruction_all <- function(ml_list, which = "between", pcs = 1:2){
+  build_df <- function(mlobj){
+    if(which == "between"){
+      if(is.null(mlobj$between_pca) || mlobj$kb < 1) return(NULL)
+      keep_pcs <- pcs[pcs <= mlobj$kb]
+      if(!length(keep_pcs)) return(NULL)
+      eig <- mlobj$between_pca$rotation[, keep_pcs, drop = FALSE]
+      scores <- mlobj$between_pca$x[, keep_pcs, drop = FALSE]
+    } else {
+      if(is.null(mlobj$within_pca) || mlobj$kw < 1) return(NULL)
+      keep_pcs <- pcs[pcs <= mlobj$kw]
+      if(!length(keep_pcs)) return(NULL)
+      eig <- mlobj$within_pca$rotation[, keep_pcs, drop = FALSE]
+      scores <- mlobj$within_pca$x[, keep_pcs, drop = FALSE]
+    }
+
+
+    mu <- mlobj$mu
+    time <- seq(0, 1, length.out = length(mu))
+    out <- list()
+
+
+    for(j in seq_along(keep_pcs)){
+      sd_pc <- sd(scores[, j], na.rm = TRUE)
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu,
+        type = "Mean",
+        PC = paste0("PC", keep_pcs[j])
+      )
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu + 2 * sd_pc * eig[, j],
+        type = "+2SD",
+        PC = paste0("PC", keep_pcs[j])
+      )
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu - 2 * sd_pc * eig[, j],
+        type = "-2SD",
+        PC = paste0("PC", keep_pcs[j])
+      )
+    }
+
+
+    bind_rows(out) %>%
+      mutate(
+        measure = mlobj$measure,
+        phase = mlobj$phase
+      )
+  }
+
+
+  df_all <- bind_rows(lapply(ml_list, build_df))
+  if(!nrow(df_all)) return(NULL)
+
+
+  df_all <- df_all %>%
+    mutate(
+      phase = factor(phase, levels = c("oc1", "script", "oc2")),
+      measure = factor(measure, levels = c("SAI", "PAI"))
+    )
+
+
+  ggplot(df_all, aes(x = time, y = value, color = PC, linetype = type)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste("FPCA reconstructed curves (", which, ")", sep = ""),
+      x = "Normalized time",
+      y = "Value"
+    )
+}
+
+
+mlfpca_sai_oc1 <- run_multilevel_fpca_phase(phase_curves$SAI, "SAI", "oc1")
+mlfpca_sai_script <- run_multilevel_fpca_phase(phase_curves$SAI, "SAI", "script")
+mlfpca_sai_oc2 <- run_multilevel_fpca_phase(phase_curves$SAI, "SAI", "oc2")
+
+
+mlfpca_pai_oc1 <- run_multilevel_fpca_phase(phase_curves$PAI, "PAI", "oc1")
+mlfpca_pai_script <- run_multilevel_fpca_phase(phase_curves$PAI, "PAI", "script")
+mlfpca_pai_oc2 <- run_multilevel_fpca_phase(phase_curves$PAI, "PAI", "oc2")
+
+
+ml_list <- list(
+  mlfpca_sai_oc1,
+  mlfpca_sai_script,
+  mlfpca_sai_oc2,
+  mlfpca_pai_oc1,
+  mlfpca_pai_script,
+  mlfpca_pai_oc2
+)
+
+
+score_tbl <- clin %>%
+  select(participant, condition, IES_T0, all_of(clinical_change_cols)) %>%
+  distinct()
+
+
+all_feature_dfs <- map(ml_list, "features")
+
+
+for(feat_df in all_feature_dfs){
+  score_tbl <- score_tbl %>%
+    full_join(feat_df, by = c("participant", "condition"))
+}
+
+
+cat("\n==== mLFPCA feature table ====\n")
+print(score_tbl)
+
+
+mlfpca_feature_table_file <- save_print_output("mlfpca_feature_table", {
+  cat("\n==== mLFPCA feature table ====\n")
+  print(score_tbl, n = Inf, width = Inf)
+})
+
+
+fpca_feature_cols <- setdiff(
+  names(score_tbl),
+  c("participant", "condition", "IES_T0", clinical_change_cols)
+)
+
+
+mlfpca_caps_results <- fpca_assoc_screen(score_tbl, outcome = "CAPS_change", variables = fpca_feature_cols)
+mlfpca_ies_results <- fpca_assoc_screen(score_tbl, outcome = "IES_T0", variables = fpca_feature_cols)
+
+
+mlfpca_clinical_change_results <- clinical_assoc_by_outcome(
+  score_tbl,
+  clinical_change_targets,
+  fpca_feature_cols
+)
+
+
+cat("\n==== mLFPCA features vs CAPS ====\n")
+print(mlfpca_caps_results)
+
+
+cat("\n==== mLFPCA features vs IES T0 ====\n")
+print(mlfpca_ies_results, n=Inf)
+
+
+cat("\n==== mLFPCA features vs clinical symptom change scores ====\n")
+print(mlfpca_clinical_change_results, n=Inf)
+
+
+mlfpca_screen_output_files <- tibble(
+  analysis = c(
+    "mlfpca_features_vs_caps",
+    "mlfpca_features_vs_ies_t0",
+    "mlfpca_features_vs_clinical_change_scores"
+  ),
+  file = c(
+    save_print_output("mlfpca_features_vs_caps", {
+      cat("\n==== mLFPCA features vs CAPS ====\n")
+      print(mlfpca_caps_results, n = Inf, width = Inf)
+    }),
+    save_print_output("mlfpca_features_vs_ies_t0", {
+      cat("\n==== mLFPCA features vs IES T0 ====\n")
+      print(mlfpca_ies_results, n = Inf, width = Inf)
+    }),
+    save_print_output("mlfpca_features_vs_clinical_change_scores", {
+      cat("\n==== mLFPCA features vs clinical symptom change scores ====\n")
+      print(mlfpca_clinical_change_results, n = Inf, width = Inf)
+    })
+  )
+)
+
+
+mlfpca_clinical_scatter_specs <- mlfpca_clinical_change_results %>%
+  filter(is.finite(p_value), p_value < 0.05) %>%
+  arrange(p_value)
+
+
+mlfpca_clinical_scatter_plots <- pmap(
+  mlfpca_clinical_scatter_specs,
+  function(outcome, outcome_label, variable, n, rho, p_value){
+    plot_individual_clinical_scatter(
+      score_tbl,
+      clinical_var = outcome,
+      feature_var = variable,
+      clinical_label = outcome_label,
+      feature_label = variable,
+      title_txt = paste(variable, "vs", outcome_label)
+    )
+  }
+)
+
+
+names(mlfpca_clinical_scatter_plots) <- pmap_chr(
+  mlfpca_clinical_scatter_specs,
+  function(outcome, outcome_label, variable, n, rho, p_value){
+    safe_plot_name("mlfpca_scatter", outcome, variable)
+  }
+)
+
+
+mlfpca_clinical_scatter_files <- imap_chr(
+  mlfpca_clinical_scatter_plots,
+  ~ save_analysis_plot(
+    .x,
+    .y,
+    directory = file.path(descriptive_plot_dir, "clinical_scatterplots"),
+    width = 7,
+    height = 5.5
+  )
+)
+
+
+mlfpca_clinical_change_models <- set_names(
+  map(clinical_change_targets$outcome, ~ fit_top_feature_model(
+    score_tbl,
+    mlfpca_clinical_change_results,
+    outcome_name = .x
+  )),
+  clinical_change_targets$outcome
+)
+
+
+top_feats <- mlfpca_clinical_change_models[["CAPS_change"]]$top_features
+m_caps_mlfpca <- mlfpca_clinical_change_models[["CAPS_change"]]$model
+
+
+mlfpca_regression_output_files <- map2_dfr(
+  clinical_change_targets$outcome,
+  clinical_change_targets$label,
+  function(outcome_name, outcome_label){
+    model_obj <- mlfpca_clinical_change_models[[outcome_name]]$model
+    output_file <- save_print_output(paste(outcome_name, "mlfpca_regression", sep = "_"), {
+      cat("\n==== ", outcome_label, " regression on top mLFPCA features ====\n", sep = "")
+
+
+      if(is.null(model_obj)){
+        cat("No usable mLFPCA features were available for regression.\n")
+      } else {
+        print(summary(model_obj))
+        print(anova(model_obj))
+      }
+    })
+
+
+    tibble(
+      outcome = outcome_name,
+      outcome_label = outcome_label,
+      file = output_file
+    )
+  }
+)
+
+
+for(i in seq_len(nrow(clinical_change_targets))){
+  outcome_name <- clinical_change_targets$outcome[i]
+  outcome_label <- clinical_change_targets$label[i]
+  model_obj <- mlfpca_clinical_change_models[[outcome_name]]$model
+
+
+  cat("\n==== ", outcome_label, " regression on top mLFPCA features ====\n", sep = "")
+
+
+  if(is.null(model_obj)){
+    cat("No usable mLFPCA features were available for regression.\n")
+  } else {
+    print(summary(model_obj))
+    print(anova(model_obj))
+  }
+}
+
+
+fpca_reconstruction_plot <- plot_fpca_reconstruction_all(ml_list, which = "between", pcs = 1:2)
+
+
+if(!is.null(fpca_reconstruction_plot)){
+  fpca_reconstruction_plot_file <- save_analysis_plot(
+    fpca_reconstruction_plot,
+    "sai_pai_fpca_reconstruction_between",
+    directory = descriptive_plot_dir,
+    width = 12,
+    height = 7
+  )
+  print(fpca_reconstruction_plot)
+} else {
+  fpca_reconstruction_plot_file <- NA_character_
+}
+
+
+clinical_output_index_file <- save_print_output("clinical_output_files", {
+  print(clinical_output_files, n = Inf, width = Inf)
+})
+
+
+gamm_output_index_file <- save_print_output("gamm_output_files", {
+  print(gamm_output_files, n = Inf, width = Inf)
+  print(gamm_plot_files, n = Inf, width = Inf)
+})
+
+
+clinical_prediction_output_index_file <- save_print_output("clinical_prediction_output_files", {
+  print(clinical_prediction_output_files, n = Inf, width = Inf)
+  print(clinical_prediction_plot_files, n = Inf, width = Inf)
+})
+
+
+transition_output_index_file <- save_print_output("transition_output_files", {
+  print(transition_output_files, n = Inf, width = Inf)
+})
+
+
+phase_model_output_index_file <- save_print_output("phase_model_output_files", {
+  print(phase_model_output_files, n = Inf, width = Inf)
+})
+
+
+phase_change_output_index_file <- save_print_output("phase_change_output_files", {
+  print(phase_change_output_files, n = Inf, width = Inf)
+})
+
+
+mlfpca_screen_output_index_file <- save_print_output("mlfpca_screen_output_files", {
+  print(mlfpca_screen_output_files, n = Inf, width = Inf)
+})
+
+
+mlfpca_regression_output_index_file <- save_print_output("mlfpca_regression_output_files", {
+  print(mlfpca_regression_output_files, n = Inf, width = Inf)
+})
+
+
+}, envir=bhi)
+```
+
+
+```{r source-nermi, include=FALSE, cache=FALSE, fig.show='hide'}
+evalq({
+
+
+# Pointwise 95% CI for the full four-trajectory DiD contrast.
+# Uses model coefficient covariance (not independent curve intervals).
+save_did_confidence_intervals <- function(model, grid, prefix) {
+  re <- vapply(model$smooth, function(s) if (inherits(s, "random.effect")) s$label else "", "")
+  X <- predict(model, newdata = grid, type = "lpmatrix", exclude = re[nzchar(re)])
+  V <- vcov(model)
+  b <- coef(model)
+  keys <- c("Interventi__T1", "Interventi__T0", "Controlli__T1", "Controlli__T0")
+  out <- list()
+  groups <- if ("measure" %in% names(grid)) as.character(grid$measure) else rep(prefix, nrow(grid))
+  for (m in unique(groups)) for (ph in unique(as.character(grid$phase))) {
+    rows <- which(groups == m & as.character(grid$phase) == ph)
+    for (tt in sort(unique(grid$time_norm[rows]))) {
+      ids <- rows[grid$time_norm[rows] == tt]
+      lookup <- paste(grid$condition[ids], grid$trial[ids], sep = "__")
+      if (length(ids) != 4L || !setequal(lookup, keys)) stop("Unexpected DiD prediction grid")
+      xx <- as.numeric(c(1, -1, -1, 1) %*% X[ids[match(keys, lookup)], , drop = FALSE])
+      fit <- sum(xx * b)
+      se <- sqrt(max(0, as.numeric(t(xx) %*% V %*% xx)))
+      out[[length(out) + 1L]] <- data.frame(measure=m, phase=ph, time_norm=tt,
+        DiD=fit, se=se, lower95=fit-1.9599639845*se, upper95=fit+1.9599639845*se)
+    }
+  }
+  result <- dplyr::bind_rows(out)
+  dir.create("manuscript_gamm_ci", recursive=TRUE, showWarnings=FALSE)
+  write.csv(result, file.path("manuscript_gamm_ci", paste0(prefix, "_did_ci.csv")), row.names=FALSE)
+  fig <- ggplot2::ggplot(result, ggplot2::aes(time_norm, DiD)) +
+    ggplot2::geom_hline(yintercept=0, linetype=2) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin=lower95, ymax=upper95), alpha=.2) +
+    ggplot2::geom_line() + ggplot2::facet_grid(measure ~ phase, scales="free_y") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(x="Normalized phase time", y="(EMDR T1-T0) - (TAU T1-T0)")
+  ggplot2::ggsave(file.path("manuscript_gamm_ci", paste0(prefix, "_did_ci.png")),
+     fig, width=11, height=if (length(unique(groups))>1) 7 else 4.5, dpi=300)
+  invisible(result)
+}
+
+
+# ANALYSIS INDEX
+# ANALYSIS 01: Joint GAMM for Valence and Motivation trajectories
+# ANALYSIS 02: Fitted trajectory plots, difference-in-differences, and within-condition change
+# ANALYSIS 03: CAPS-moderated GAMMs and CAPS-stratified trajectory plots
+# ANALYSIS 04: mLFPCA feature screening, CAPS regression, and reconstructed curves
+
+
+# =========================================================
+# PACKAGES
+# =========================================================
+pkgs <- c("tidyverse", "zoo", "mgcv", "readxl")
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if(length(to_install)) install.packages(to_install)
+
+
+library(tidyverse)
+library(zoo)
+library(mgcv)
+library(readxl)
+
+
+# =========================================================
+# FILES
+# =========================================================
+func_path <- file.path(input_dir, "functional_cleaned_long_nermi.csv")
+clin_path <- file.path(input_dir, "Participant data.xlsx")
+survey_path <- file.path(input_dir, "Dataset for IES-R, STAI Y1 e 2, BDI.xlsx")
+
+
+raw <- read_csv(func_path, show_col_types = FALSE)
+clin_raw <- read_excel(clin_path)
+survey_raw <- read_excel(survey_path)
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+n_grid <- 100
+roll_k <- 11
+phase_levels <- c("oc1", "script", "oc2")
+descriptive_plot_dir <- "NerMI_descriptive_plots"
+moderation_plot_dir <- "NerMI_moderation_plots"
+model_output_dir <- "NerMI_model_outputs"
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+coalesce_override <- function(base_df, override_df, by){
+  override_cols <- setdiff(names(override_df), by)
+
+
+  merged <- base_df %>%
+    full_join(override_df, by = by, suffix = c("", "_override"))
+
+
+  for(col in override_cols){
+    override_col <- paste0(col, "_override")
+    if(override_col %in% names(merged)){
+      merged[[col]] <- dplyr::coalesce(merged[[override_col]], merged[[col]])
+      merged[[override_col]] <- NULL
+    }
+  }
+
+
+  merged
+}
+
+
+row_sum_cols <- function(df, cols){
+  cols <- intersect(cols, names(df))
+  if(!length(cols)) return(rep(NA_real_, nrow(df)))
+
+
+  mat <- df %>%
+    select(all_of(cols)) %>%
+    mutate(across(everything(), as.numeric)) %>%
+    as.matrix()
+
+
+  rowSums(mat, na.rm = FALSE)
+}
+
+
+ies_subscale_sum <- function(df, visit_prefix, items){
+  row_sum_cols(df, paste0(visit_prefix, items))
+}
+
+
+`%||%` <- function(x, y){
+  if(is.null(x)) y else x
+}
+
+
+safe_plot_name <- function(...){
+  name <- paste(..., sep = "_")
+  name <- gsub("[^A-Za-z0-9]+", "_", name)
+  name <- gsub("^_+|_+$", "", name)
+  tolower(name)
+}
+
+
+condition_display <- function(x){
+  factor(
+    dplyr::recode(
+      as.character(x),
+      "Controlli" = "TAU",
+      "Interventi" = "EMDR",
+      .default = as.character(x)
+    ),
+    levels = c("TAU", "EMDR")
+  )
+}
+
+
+condition_palette <- c("TAU" = "#4C78A8", "EMDR" = "#F58518")
+phase_labels <- c("oc1" = "OC1", "script" = "Script", "oc2" = "OC2")
+
+
+save_analysis_plot <- function(plot, file_stem, directory = descriptive_plot_dir,
+                               width = 12, height = 7){
+  dir.create(directory, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(directory, paste0(safe_plot_name(file_stem), ".png"))
+
+
+  ggsave(
+    filename = out_file,
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+
+
+  out_file
+}
+
+
+make_two_bin_breaks <- function(x){
+  rng <- range(x, na.rm = TRUE)
+  if(!all(is.finite(rng))){
+    return(c(-Inf, 0, Inf))
+  }
+  if(diff(rng) == 0){
+    rng <- rng + c(-0.5, 0.5)
+  }
+  seq(rng[1], rng[2], length.out = 3)
+}
+
+
+outcome_improvement_label <- function(x){
+  med <- median(x, na.rm = TRUE)
+  if_else(x <= med, "MoreImproved", "LessImproved")
+}
+
+
+save_moderation_plot <- function(plot, outcome_name, plot_kind, width = 12, height = 7){
+  dir.create(moderation_plot_dir, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(
+    moderation_plot_dir,
+    paste0(safe_plot_name(outcome_name, plot_kind), ".png")
+  )
+
+
+  ggsave(
+    filename = out_file,
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+
+
+  out_file
+}
+
+
+save_print_output <- function(file_name, expr){
+  dir.create(model_output_dir, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(model_output_dir, paste0(safe_plot_name(file_name), ".txt"))
+  lines <- capture.output(eval(substitute(expr), parent.frame()))
+  writeLines(lines, out_file)
+  out_file
+}
+
+
+clinical_assoc_by_outcome <- function(df, outcomes, variables){
+  map2_dfr(outcomes$outcome, outcomes$label, function(outcome_name, outcome_label){
+    fpca_assoc_screen(df, outcome = outcome_name, variables = variables) %>%
+      mutate(
+        outcome = outcome_name,
+        outcome_label = outcome_label,
+        .before = 1
+      )
+  })
+}
+
+
+fit_top_feature_model <- function(df, results_tbl, outcome_name, n_top = 4){
+  top_features <- results_tbl %>%
+    filter(outcome == outcome_name, is.finite(p_value)) %>%
+    slice_head(n = n_top) %>%
+    pull(variable)
+
+
+  if(!length(top_features)){
+    return(list(model = NULL, top_features = character()))
+  }
+
+
+  form_txt <- paste(
+    outcome_name,
+    "~ condition +",
+    paste(top_features, collapse = " + ")
+  )
+
+
+  list(
+    model = lm(as.formula(form_txt), data = df),
+    top_features = top_features
+  )
+}
+
+
+smooth_resample_phase <- function(df_phase, value_col, n_grid = 100, roll_k = 11){
+  y <- df_phase[[value_col]]
+  t <- df_phase$timestamps
+
+
+  keep <- is.finite(t) & is.finite(y)
+  t <- t[keep]
+  y <- y[keep]
+
+
+  if(length(y) < 5) return(rep(NA_real_, n_grid))
+
+
+  ord <- order(t)
+  t <- t[ord]
+  y <- y[ord]
+
+
+  t <- t - min(t, na.rm = TRUE)
+
+
+  y_sm <- zoo::rollmedian(y, k = roll_k, fill = NA, align = "center")
+  good <- is.finite(t) & is.finite(y_sm)
+
+
+  if(sum(good) < 5) return(rep(NA_real_, n_grid))
+
+
+  t2 <- t[good]
+  y2 <- y_sm[good]
+
+
+  if(max(t2) == min(t2)){
+    return(rep(median(y2, na.rm = TRUE), n_grid))
+  }
+
+
+  t2 <- (t2 - min(t2)) / (max(t2) - min(t2))
+  grid <- seq(0, 1, length.out = n_grid)
+
+
+  approx(x = t2, y = y2, xout = grid, rule = 2)$y
+}
+
+
+build_phase_curves <- function(data, value_col, n_grid = 100, roll_k = 11){
+  keys <- data %>%
+    distinct(participant, condition, trial, task) %>%
+    arrange(condition, participant, trial, task)
+
+
+  out_list <- vector("list", nrow(keys))
+
+
+  for(i in seq_len(nrow(keys))){
+    key <- keys[i, ]
+
+
+    g <- data %>%
+      filter(
+        participant == key$participant,
+        condition == key$condition,
+        trial == key$trial,
+        task == key$task
+      )
+
+
+    curve <- smooth_resample_phase(g, value_col, n_grid = n_grid, roll_k = roll_k)
+
+
+    out_list[[i]] <- tibble(
+      participant = key$participant,
+      condition = key$condition,
+      trial = key$trial,
+      phase = key$task
+    ) %>%
+      bind_cols(as_tibble_row(setNames(as.list(curve), paste0("t", seq_len(n_grid)))))
+  }
+
+
+  bind_rows(out_list)
+}
+
+
+make_long_phase_curve <- function(df, measure_name){
+  df %>%
+    pivot_longer(
+      cols = matches("^t[0-9]+$"),
+      names_to = "t_idx",
+      values_to = "value"
+    ) %>%
+    mutate(
+      t_idx = as.numeric(gsub("^t", "", t_idx)),
+      time_norm = (t_idx - 1) / (max(t_idx) - 1),
+      measure = measure_name
+    ) %>%
+    select(participant, condition, trial, phase, measure, time_norm, value)
+}
+
+
+plot_subject_phase_trajectories <- function(phase_df, variable_label, ylab_txt = NULL){
+  ylab_txt <- ylab_txt %||% paste(variable_label, "value")
+  panel_levels <- tidyr::expand_grid(
+    condition_label = factor(c("TAU", "EMDR"), levels = c("TAU", "EMDR")),
+    trial = factor(c("T0", "T1"), levels = c("T0", "T1")),
+    phase = factor(phase_levels, levels = phase_levels)
+  ) %>%
+    mutate(
+      phase_label = unname(phase_labels[as.character(phase)]),
+      panel_label = paste(condition_label, trial, phase_label, sep = " - ")
+    ) %>%
+    pull(panel_label)
+
+
+  long <- phase_df %>%
+    pivot_longer(
+      cols = matches("^t[0-9]+$"),
+      names_to = "idx",
+      values_to = "value"
+    ) %>%
+    mutate(
+      idx = as.numeric(gsub("^t", "", idx)),
+      time_norm = (idx - min(idx, na.rm = TRUE)) /
+        (max(idx, na.rm = TRUE) - min(idx, na.rm = TRUE)),
+      condition_label = condition_display(condition),
+      trial = factor(trial, levels = c("T0", "T1")),
+      phase = factor(phase, levels = phase_levels),
+      phase_label = unname(phase_labels[as.character(phase)]),
+      panel_label = factor(
+        paste(condition_label, trial, phase_label, sep = " - "),
+        levels = panel_levels
+      )
+    ) %>%
+    filter(is.finite(time_norm), is.finite(value))
+
+
+  mean_df <- long %>%
+    group_by(condition_label, trial, phase, panel_label, time_norm) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+
+  ggplot(long, aes(x = time_norm, y = value)) +
+    geom_line(
+      aes(group = participant),
+      color = "#8C9AA6",
+      alpha = 0.22,
+      linewidth = 0.35
+    ) +
+    geom_line(
+      data = mean_df,
+      aes(y = mean_value, color = condition_label, group = interaction(condition_label, trial, phase)),
+      linewidth = 1.25
+    ) +
+    facet_wrap(~ panel_label, ncol = 3, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = paste(variable_label, "subject-level trajectories by group, visit, and phase"),
+      subtitle = "Thin lines are participants; thick lines are group means.",
+      x = "Normalized time within phase",
+      y = ylab_txt,
+      color = "Group mean"
+    )
+}
+
+
+plot_individual_clinical_scatter <- function(df, clinical_var, feature_var,
+                                             clinical_label = NULL,
+                                             feature_label = NULL,
+                                             title_txt = NULL){
+  clinical_label <- clinical_label %||% paste(clinical_var, "(T1 - T0)")
+  feature_label <- feature_label %||% feature_var
+  title_txt <- title_txt %||% paste(feature_label, "vs", clinical_label)
+
+
+  d <- df %>%
+    select(participant, condition, all_of(c(clinical_var, feature_var))) %>%
+    filter(is.finite(.data[[clinical_var]]), is.finite(.data[[feature_var]])) %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  if(nrow(d) >= 3){
+    ct <- suppressWarnings(cor.test(d[[clinical_var]], d[[feature_var]], method = "spearman", exact = FALSE))
+    stat_label <- paste0(
+      "Spearman rho = ", sprintf("%.2f", unname(ct$estimate)),
+      "\np = ", format.pval(ct$p.value, digits = 2, eps = 0.001),
+      "\nn = ", nrow(d)
+    )
+  } else {
+    stat_label <- paste0("n = ", nrow(d))
+  }
+
+
+  ggplot(d, aes(x = .data[[clinical_var]], y = .data[[feature_var]], color = condition_label)) +
+    geom_hline(yintercept = 0, linewidth = 0.35, color = "#2F7FD0", alpha = 0.7) +
+    geom_vline(xintercept = 0, linewidth = 0.35, color = "#2F7FD0", alpha = 0.7) +
+    geom_point(size = 2.7, alpha = 0.9) +
+    geom_smooth(aes(group = 1), method = "lm", se = FALSE, color = "#2F2F2F",
+                linewidth = 0.8, linetype = "dashed") +
+    annotate("label", x = Inf, y = Inf, hjust = 1.04, vjust = 1.15,
+             label = stat_label, size = 3.6, label.size = 0.2, alpha = 0.9) +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = title_txt,
+      x = paste0(clinical_label, " (T1 - T0; lower = more improvement)"),
+      y = feature_label,
+      color = "Group"
+    )
+}
+
+
+build_prediction_grid <- function(long_df, n_time = 200){
+  pred_grid <- expand.grid(
+    time_norm = seq(0, 1, length.out = n_time),
+    measure = levels(long_df$measure),
+    condition = levels(long_df$condition),
+    trial = levels(long_df$trial),
+    phase = levels(long_df$phase)
+  ) %>%
+    as_tibble()
+
+
+  pred_grid$subj <- long_df$subj[1]
+  pred_grid$subj_visit <- long_df$subj_visit[1]
+  pred_grid$subj_visit_phase <- long_df$subj_visit_phase[1]
+  pred_grid$curve_group <- interaction(
+    pred_grid$measure,
+    pred_grid$condition,
+    pred_grid$trial,
+    pred_grid$phase,
+    drop = TRUE
+  )
+
+
+  pred_grid
+}
+
+
+plot_fitted_trajectories <- function(pred_grid){
+  plot_df <- pred_grid %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = fit, color = condition_label, linetype = trial)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Fitted trajectories by measure, phase, condition, and visit",
+      x = "Normalized time within phase",
+      y = "Fitted value",
+      color = "Group"
+    )
+}
+
+
+build_did_curves <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, phase, condition, trial, fit) %>%
+    mutate(ct = paste(condition, trial, sep = "__")) %>%
+    select(-condition, -trial) %>%
+    pivot_wider(names_from = ct, values_from = fit) %>%
+    mutate(DiD = (Interventi__T1 - Interventi__T0) - (Controlli__T1 - Controlli__T0))
+}
+
+
+plot_did_curves <- function(did_df){
+  ggplot(did_df, aes(x = time_norm, y = DiD)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Treatment effect on trajectory shape: difference-in-differences",
+      x = "Normalized time within phase",
+      y = "(EMDR T1 - T0) - (TAU T1 - T0)"
+    )
+}
+
+
+build_within_condition_change <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, phase, condition, trial, fit) %>%
+    pivot_wider(
+      id_cols = c(time_norm, measure, phase, condition),
+      names_from = trial,
+      values_from = fit
+    ) %>%
+    mutate(change_T1_minus_T0 = T1 - T0)
+}
+
+
+plot_within_condition_change <- function(change_df){
+  plot_df <- change_df %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = change_T1_minus_T0, color = condition_label)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Within-condition change from T0 to T1",
+      x = "Normalized time within phase",
+      y = "T1 - T0",
+      color = "Group"
+    )
+}
+
+
+build_caps_prediction_grid <- function(long_df, probs = c(0.25, 0.75), n_time = 200,
+                                       bin_breaks = NULL){
+  caps_levels <- quantile(long_df$CAPS_c, probs = probs, na.rm = TRUE)
+  if(is.null(bin_breaks)){
+    bin_breaks <- make_two_bin_breaks(long_df$CAPS_c)
+  }
+
+
+  pred_grid <- expand.grid(
+    time_norm = seq(0, 1, length.out = n_time),
+    measure = levels(long_df$measure),
+    condition = levels(long_df$condition),
+    trial = levels(long_df$trial),
+    phase = levels(long_df$phase),
+    CAPS_c = caps_levels
+  ) %>%
+    as_tibble()
+
+
+  pred_grid$subj <- long_df$subj[1]
+  pred_grid$subj_visit <- long_df$subj_visit[1]
+  pred_grid$subj_visit_phase <- long_df$subj_visit_phase[1]
+  pred_grid$curve_group <- interaction(
+    pred_grid$measure,
+    pred_grid$condition,
+    pred_grid$trial,
+    pred_grid$phase,
+    drop = TRUE
+  )
+  pred_grid$CAPS_bin <- cut(pred_grid$CAPS_c, breaks = bin_breaks, include.lowest = TRUE)
+  pred_grid$caps_curve_group <- factor(
+    interaction(pred_grid$measure, pred_grid$trial, pred_grid$phase, pred_grid$CAPS_bin, drop = TRUE),
+    levels = levels(long_df$caps_curve_group)
+  )
+  pred_grid$CAPS_level <- factor(
+    outcome_improvement_label(pred_grid$CAPS_c),
+    levels = c("LessImproved", "MoreImproved")
+  )
+
+
+  pred_grid
+}
+
+
+plot_caps_fitted_trajectories <- function(pred_grid_caps){
+  plot_df <- pred_grid_caps %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = fit, color = condition_label, linetype = trial)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure + CAPS_level ~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Fitted trajectories moderated by CAPS improvement",
+      x = "Normalized time within phase",
+      y = "Fitted value",
+      color = "Group"
+    )
+}
+
+
+build_caps_difference_curves <- function(pred_grid_caps){
+  pred_grid_caps %>%
+    select(time_norm, measure, condition, trial, phase, CAPS_level, fit) %>%
+    pivot_wider(
+      id_cols = c(time_norm, measure, condition, trial, phase),
+      names_from = CAPS_level,
+      values_from = fit
+    ) %>%
+    mutate(CAPS_diff = MoreImproved - LessImproved) %>%
+    group_by(time_norm, measure, trial, phase) %>%
+    summarise(CAPS_diff = mean(CAPS_diff, na.rm = TRUE), .groups = "drop")
+}
+
+
+plot_caps_difference_curves <- function(caps_diff_df){
+  ggplot(caps_diff_df, aes(x = time_norm, y = CAPS_diff, linetype = trial)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1, color = "#2F2F2F") +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Condition-adjusted trajectory differences by degree of CAPS improvement",
+      x = "Normalized time within phase",
+      y = "MoreImproved - LessImproved"
+    )
+}
+
+
+build_clinical_prediction_grid <- function(long_df, probs = c(0.25, 0.75), n_time = 200,
+                                           bin_breaks = NULL){
+  clinical_levels <- quantile(long_df$clinical_c, probs = probs, na.rm = TRUE)
+  if(is.null(bin_breaks)){
+    bin_breaks <- make_two_bin_breaks(long_df$clinical_c)
+  }
+
+
+  pred_grid <- expand.grid(
+    time_norm = seq(0, 1, length.out = n_time),
+    measure = levels(long_df$measure),
+    condition = levels(long_df$condition),
+    trial = levels(long_df$trial),
+    phase = levels(long_df$phase),
+    clinical_c = clinical_levels
+  ) %>%
+    as_tibble()
+
+
+  pred_grid$subj <- long_df$subj[1]
+  pred_grid$subj_visit <- long_df$subj_visit[1]
+  pred_grid$subj_visit_phase <- long_df$subj_visit_phase[1]
+  pred_grid$curve_group <- interaction(
+    pred_grid$measure,
+    pred_grid$condition,
+    pred_grid$trial,
+    pred_grid$phase,
+    drop = TRUE
+  )
+  pred_grid$clinical_bin <- cut(pred_grid$clinical_c, breaks = bin_breaks, include.lowest = TRUE)
+  pred_grid$clinical_curve_group <- factor(
+    interaction(pred_grid$measure, pred_grid$trial, pred_grid$phase, pred_grid$clinical_bin, drop = TRUE),
+    levels = levels(long_df$clinical_curve_group)
+  )
+  pred_grid$Clinical_level <- factor(
+    outcome_improvement_label(pred_grid$clinical_c),
+    levels = c("LessImproved", "MoreImproved")
+  )
+
+
+  pred_grid
+}
+
+
+plot_clinical_fitted_trajectories <- function(pred_grid, outcome_label){
+  plot_df <- pred_grid %>%
+    mutate(condition_label = condition_display(condition))
+
+
+  ggplot(plot_df, aes(x = time_norm, y = fit, color = condition_label, linetype = trial)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure + Clinical_level ~ phase, scales = "free_y") +
+    scale_color_manual(values = condition_palette, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste("Fitted trajectories moderated by", outcome_label),
+      x = "Normalized time within phase",
+      y = "Fitted value",
+      color = "Group"
+    )
+}
+
+
+build_clinical_difference_curves <- function(pred_grid){
+  pred_grid %>%
+    select(time_norm, measure, condition, trial, phase, Clinical_level, fit) %>%
+    pivot_wider(
+      id_cols = c(time_norm, measure, condition, trial, phase),
+      names_from = Clinical_level,
+      values_from = fit
+    ) %>%
+    mutate(Clinical_diff = MoreImproved - LessImproved) %>%
+    group_by(time_norm, measure, trial, phase) %>%
+    summarise(Clinical_diff = mean(Clinical_diff, na.rm = TRUE), .groups = "drop")
+}
+
+
+plot_clinical_difference_curves <- function(clinical_diff_df, outcome_label){
+  ggplot(clinical_diff_df, aes(x = time_norm, y = Clinical_diff, linetype = trial)) +
+    geom_hline(yintercept = 0, linetype = 2, alpha = 0.5) +
+    geom_line(linewidth = 1.1, color = "#2F2F2F") +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste("Condition-adjusted trajectory differences by degree of", outcome_label),
+      x = "Normalized time within phase",
+      y = "MoreImproved - LessImproved"
+    )
+}
+
+
+fit_clinical_moderation <- function(long_vm, clin, outcome_name, outcome_label,
+                                    probs = c(0.25, 0.75), n_time = 200){
+  long_df <- long_vm %>%
+    left_join(clin %>% select(participant, condition, all_of(outcome_name)), by = c("participant", "condition")) %>%
+    rename(clinical_outcome = all_of(outcome_name)) %>%
+    filter(is.finite(clinical_outcome)) %>%
+    mutate(
+      clinical_c = as.numeric(scale(clinical_outcome, center = TRUE, scale = FALSE)),
+      curve_group_clinical = interaction(measure, trial, phase, drop = TRUE)
+    )
+
+
+  clinical_bin_breaks <- make_two_bin_breaks(long_df$clinical_c)
+  long_df <- long_df %>%
+    mutate(
+      clinical_bin = cut(clinical_c, breaks = clinical_bin_breaks, include.lowest = TRUE),
+      clinical_curve_group = interaction(curve_group_clinical, clinical_bin, drop = TRUE)
+    )
+
+
+  gamm_1 <- bam(
+    value ~
+      measure * condition * trial * phase +
+      clinical_c * measure * trial * phase +
+      s(time_norm, by = curve_group, bs = "cr", k = 6) +
+      s(subj, bs = "re") +
+      s(subj_visit, bs = "re") +
+      s(subj_visit_phase, bs = "re"),
+    data = long_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+
+  gamm_2 <- bam(
+    value ~
+      measure * condition * trial * phase +
+      clinical_c * measure * trial * phase +
+      s(time_norm, by = curve_group, bs = "cr", k = 6) +
+      s(time_norm, by = clinical_curve_group, bs = "cr", k = 6) +
+      s(subj, bs = "re") +
+      s(subj_visit, bs = "re") +
+      s(subj_visit_phase, bs = "re"),
+    data = long_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+
+  pred_grid <- build_clinical_prediction_grid(
+    long_df,
+    probs = probs,
+    n_time = n_time,
+    bin_breaks = clinical_bin_breaks
+  )
+  pred_grid$fit <- predict(gamm_2, newdata = pred_grid, type = "response")
+
+
+  list(
+    outcome = outcome_name,
+    outcome_label = outcome_label,
+    long_df = long_df,
+    gamm_1 = gamm_1,
+    gamm_2 = gamm_2,
+    pred_grid = pred_grid,
+    diff_df = build_clinical_difference_curves(pred_grid)
+  )
+}
+
+
+time_cols <- paste0("t", seq_len(n_grid))
+
+
+choose_ncomp <- function(sdev, pve = 0.90, max_n = 3){
+  if(length(sdev) == 0 || all(!is.finite(sdev))) return(0L)
+
+
+  total_var <- sum(sdev^2, na.rm = TRUE)
+  if(!is.finite(total_var) || total_var <= 0) return(0L)
+
+
+  var_expl <- sdev^2 / total_var
+  cumvar <- cumsum(var_expl)
+  k <- which(cumvar >= pve)[1]
+
+
+  if(is.na(k)) k <- length(sdev)
+  as.integer(min(k, max_n))
+}
+
+
+run_multilevel_fpca_phase <- function(df_phase, measure_name, phase_name,
+                                      pve_between = 0.90,
+                                      pve_within = 0.90,
+                                      max_between = 2,
+                                      max_within = 2){
+  d <- df_phase %>%
+    filter(phase == phase_name) %>%
+    filter(if_all(all_of(time_cols), is.finite)) %>%
+    arrange(participant, trial)
+
+
+  if(nrow(d) < 4){
+    return(list(
+      measure = measure_name,
+      phase = phase_name,
+      mu = rep(NA_real_, length(time_cols)),
+      between_pca = NULL,
+      within_pca = NULL,
+      kb = 0L,
+      kw = 0L,
+      features = tibble(participant = character(), condition = factor())
+    ))
+  }
+
+
+  Y <- as.matrix(d[, time_cols])
+  cond_map <- d %>% distinct(participant, condition)
+
+
+  mu <- colMeans(Y, na.rm = TRUE)
+
+
+  subj_mean_df <- d %>%
+    group_by(participant) %>%
+    summarise(across(all_of(time_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+
+  Y_between <- as.matrix(subj_mean_df[, time_cols])
+  Y_between_centered <- sweep(Y_between, 2, mu, "-")
+
+
+  pca_between <- prcomp(Y_between_centered, center = FALSE, scale. = FALSE)
+  kb <- choose_ncomp(pca_between$sdev, pve = pve_between, max_n = max_between)
+
+
+  if(kb > 0){
+    between_scores <- as.data.frame(pca_between$x[, seq_len(kb), drop = FALSE])
+    names(between_scores) <- paste0(measure_name, "_", phase_name, "_bPC", seq_len(kb))
+    between_scores$participant <- subj_mean_df$participant
+  } else {
+    between_scores <- tibble(participant = subj_mean_df$participant)
+  }
+
+
+  subj_mean_map <- subj_mean_df %>%
+    rename_with(~ paste0(.x, "_subjmean"), all_of(time_cols))
+
+
+  d_with_means <- d %>%
+    left_join(subj_mean_map, by = "participant")
+
+
+  Y_within <- matrix(NA_real_, nrow = nrow(d_with_means), ncol = length(time_cols))
+  colnames(Y_within) <- time_cols
+
+
+  for(j in seq_along(time_cols)){
+    Y_within[, j] <- d_with_means[[time_cols[j]]] - d_with_means[[paste0(time_cols[j], "_subjmean")]]
+  }
+
+
+  complete_within <- complete.cases(Y_within)
+  Y_within <- Y_within[complete_within, , drop = FALSE]
+  within_meta <- d_with_means[complete_within, c("participant", "condition", "trial", "phase")]
+
+
+  if(nrow(Y_within) >= 4){
+    pca_within <- prcomp(Y_within, center = FALSE, scale. = FALSE)
+    kw <- choose_ncomp(pca_within$sdev, pve = pve_within, max_n = max_within)
+  } else {
+    pca_within <- NULL
+    kw <- 0L
+  }
+
+
+  if(kw > 0){
+    within_scores <- as.data.frame(pca_within$x[, seq_len(kw), drop = FALSE])
+    names(within_scores) <- paste0(measure_name, "_", phase_name, "_wPC", seq_len(kw))
+    within_scores <- bind_cols(within_meta, within_scores)
+
+
+    within_change <- within_scores %>%
+      pivot_wider(
+        id_cols = c(participant, condition, phase),
+        names_from = trial,
+        values_from = starts_with(paste0(measure_name, "_", phase_name, "_wPC"))
+      )
+
+
+    for(k in seq_len(kw)){
+      base <- paste0(measure_name, "_", phase_name, "_wPC", k)
+      c0 <- paste0(base, "_T0")
+      c1 <- paste0(base, "_T1")
+      if(all(c(c0, c1) %in% names(within_change))){
+        within_change[[paste0(base, "_change")]] <- within_change[[c1]] - within_change[[c0]]
+      }
+    }
+
+
+    within_change <- within_change %>%
+      select(participant, condition, ends_with("_change"))
+  } else {
+    within_change <- cond_map
+  }
+
+
+  subj_features <- between_scores %>%
+    left_join(cond_map, by = "participant") %>%
+    left_join(within_change, by = c("participant", "condition"))
+
+
+  list(
+    measure = measure_name,
+    phase = phase_name,
+    mu = mu,
+    between_pca = pca_between,
+    within_pca = pca_within,
+    kb = kb,
+    kw = kw,
+    features = subj_features
+  )
+}
+
+
+fpca_assoc_screen <- function(df, outcome, variables = NULL){
+  if(is.null(variables)){
+    variables <- names(df)
+  }
+
+
+  feat_cols <- setdiff(variables, c("participant", "condition", outcome))
+  rows <- list()
+
+
+  for(v in feat_cols){
+    ok <- is.finite(df[[v]]) & is.finite(df[[outcome]])
+    if(sum(ok) < 6) next
+
+
+    ct <- suppressWarnings(cor.test(df[[v]][ok], df[[outcome]][ok], method = "spearman"))
+    rows[[length(rows) + 1]] <- tibble(
+      variable = v,
+      n = sum(ok),
+      rho = unname(ct$estimate),
+      p_value = ct$p.value
+    )
+  }
+
+
+  if(!length(rows)){
+    return(tibble(
+      variable = character(),
+      n = integer(),
+      rho = numeric(),
+      p_value = numeric()
+    ))
+  }
+
+
+  bind_rows(rows) %>% arrange(p_value)
+}
+
+
+build_fpca_reconstruction_data <- function(ml_list, which = "between", pcs = 1:2){
+  build_df <- function(mlobj){
+    if(which == "between"){
+      if(is.null(mlobj$between_pca) || mlobj$kb < 1) return(NULL)
+      keep_pcs <- pcs[pcs <= mlobj$kb]
+      if(!length(keep_pcs)) return(NULL)
+      eig <- mlobj$between_pca$rotation[, keep_pcs, drop = FALSE]
+      scores <- mlobj$between_pca$x[, keep_pcs, drop = FALSE]
+    } else {
+      if(is.null(mlobj$within_pca) || mlobj$kw < 1) return(NULL)
+      keep_pcs <- pcs[pcs <= mlobj$kw]
+      if(!length(keep_pcs)) return(NULL)
+      eig <- mlobj$within_pca$rotation[, keep_pcs, drop = FALSE]
+      scores <- mlobj$within_pca$x[, keep_pcs, drop = FALSE]
+    }
+
+
+    mu <- mlobj$mu
+    time <- seq(0, 1, length.out = length(mu))
+    out <- list()
+
+
+    for(j in seq_along(keep_pcs)){
+      sd_pc <- sd(scores[, j], na.rm = TRUE)
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu,
+        type = "Mean",
+        PC = paste0("PC", keep_pcs[j])
+      )
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu + 2 * sd_pc * eig[, j],
+        type = "+2SD",
+        PC = paste0("PC", keep_pcs[j])
+      )
+
+
+      out[[length(out) + 1]] <- tibble(
+        time = time,
+        value = mu - 2 * sd_pc * eig[, j],
+        type = "-2SD",
+        PC = paste0("PC", keep_pcs[j])
+      )
+    }
+
+
+    bind_rows(out) %>%
+      mutate(
+        measure = mlobj$measure,
+        phase = mlobj$phase
+      )
+  }
+
+
+  df_all <- bind_rows(lapply(ml_list, build_df))
+  if(!nrow(df_all)) return(tibble())
+
+
+  df_all %>%
+    mutate(
+      phase = factor(phase, levels = c("oc1", "script", "oc2")),
+      measure = factor(measure, levels = c("Valence", "Motivation")),
+      PC = factor(PC, levels = c("PC1", "PC2")),
+      type = factor(type, levels = c("-2SD", "+2SD", "Mean"))
+    )
+}
+
+
+plot_fpca_reconstruction_all <- function(ml_list, which = "between", pcs = 1:2){
+  df_all <- build_fpca_reconstruction_data(ml_list, which = which, pcs = pcs)
+  if(!nrow(df_all)) return(NULL)
+
+
+  p <- ggplot(df_all, aes(x = time, y = value, color = PC, linetype = type)) +
+    geom_line(linewidth = 1.1) +
+    facet_grid(measure ~ phase, scales = "free_y") +
+    scale_color_manual(values = c("PC1" = "#F8766D", "PC2" = "#00BFC4"), drop = FALSE) +
+    scale_linetype_manual(values = c("-2SD" = "dashed", "+2SD" = "dotted", "Mean" = "solid"), drop = FALSE) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste("FPCA reconstructed curves (", which, ")", sep = ""),
+      x = "Normalized time",
+      y = "Value"
+    )
+
+
+  print(p)
+  invisible(p)
+}
+
+
+# =========================================================
+# CLEAN DATA
+# =========================================================
+dat <- raw %>%
+  mutate(
+    participant = str_squish(as.character(participant)),
+    condition = factor(condition, levels = c("Controlli", "Interventi")),
+    trial = factor(toupper(as.character(trial)), levels = c("T0", "T1")),
+    task = factor(tolower(as.character(task)), levels = phase_levels),
+    timestamps = as.numeric(timestamps),
+    NERMI_Valence = as.numeric(NERMI_Valence),
+    NERMI_Motivation = as.numeric(NERMI_Motivation)
+  ) %>%
+  filter(task %in% phase_levels)
+
+
+paired_participants <- dat %>%
+  distinct(participant, condition, trial) %>%
+  count(participant, condition, name = "n_trials") %>%
+  filter(n_trials == 2) %>%
+  select(participant, condition)
+
+
+survey_cols <- c(
+  "PZ",
+  grep("^(IEST|STAY1T|STAY2T|BDIT)", names(survey_raw), value = TRUE)
+)
+
+
+clin_source <- coalesce_override(
+  clin_raw,
+  survey_raw %>% select(any_of(survey_cols)),
+  by = "PZ"
+)
+
+
+clin <- clin_source %>%
+  rename(participant = PZ) %>%
+  mutate(
+    participant = str_squish(as.character(participant)),
+    IES_T0 = as.numeric(IEST0TOT),
+    IES_T1 = as.numeric(IEST1TOT),
+    IES_change = IES_T1 - IES_T0,
+    IES_intrusion_T0 = ies_subscale_sum(., "IEST0", c(1, 2, 3, 6, 9, 14, 16, 20)),
+    IES_intrusion_T1 = ies_subscale_sum(., "IEST1", c(1, 2, 3, 6, 9, 14, 16, 20)),
+    IES_intrusion_change = IES_intrusion_T1 - IES_intrusion_T0,
+    IES_avoidance_T0 = ies_subscale_sum(., "IEST0", c(5, 7, 8, 11, 12, 13, 17, 22)),
+    IES_avoidance_T1 = ies_subscale_sum(., "IEST1", c(5, 7, 8, 11, 12, 13, 17, 22)),
+    IES_avoidance_change = IES_avoidance_T1 - IES_avoidance_T0,
+    IES_hyperarousal_T0 = ies_subscale_sum(., "IEST0", c(4, 10, 15, 18, 19, 21)),
+    IES_hyperarousal_T1 = ies_subscale_sum(., "IEST1", c(4, 10, 15, 18, 19, 21)),
+    IES_hyperarousal_change = IES_hyperarousal_T1 - IES_hyperarousal_T0,
+    STAI_Y1_T0 = as.numeric(STAY1T0TOT),
+    STAI_Y1_T1 = as.numeric(STAY1T1TOT),
+    STAI_Y1_change = STAI_Y1_T1 - STAI_Y1_T0,
+    STAI_Y2_T0 = as.numeric(STAY2T0TOT),
+    STAI_Y2_T1 = as.numeric(STAY2T1TOT),
+    STAI_Y2_change = STAI_Y2_T1 - STAI_Y2_T0,
+    CAPS_change = as.numeric(CAPST1TOT) - as.numeric(CAPST0TOT)
+  ) %>%
+  inner_join(paired_participants, by = "participant") %>%
+  select(
+    participant,
+    condition,
+    CAPS_change,
+    IES_T0,
+    IES_T1,
+    IES_change,
+    IES_intrusion_T0,
+    IES_intrusion_T1,
+    IES_intrusion_change,
+    IES_avoidance_T0,
+    IES_avoidance_T1,
+    IES_avoidance_change,
+    IES_hyperarousal_T0,
+    IES_hyperarousal_T1,
+    IES_hyperarousal_change,
+    STAI_Y1_T0,
+    STAI_Y1_T1,
+    STAI_Y1_change,
+    STAI_Y2_T0,
+    STAI_Y2_T1,
+    STAI_Y2_change
+  ) %>%
+  distinct()
+
+
+clinical_change_targets <- tribble(
+  ~outcome, ~label,
+  "CAPS_change", "CAPS change",
+  "IES_change", "IES-R total change",
+  "IES_intrusion_change", "IES-R intrusion change",
+  "IES_avoidance_change", "IES-R avoidance change",
+  "IES_hyperarousal_change", "IES-R hyperarousal change",
+  "STAI_Y1_change", "STAI Y1 change",
+  "STAI_Y2_change", "STAI Y2 change"
+)
+
+
+additional_change_targets <- clinical_change_targets %>%
+  filter(outcome != "CAPS_change")
+
+
+analysis_ids <- clin %>% distinct(participant)
+
+
+dat <- dat %>%
+  semi_join(analysis_ids, by = "participant")
+
+
+message("Analysis sample: ", n_distinct(dat$participant), " participants with paired T0/T1 physiology and clinical data.")
+
+
+phase_val <- build_phase_curves(dat, "NERMI_Valence", n_grid = n_grid, roll_k = roll_k)
+phase_mot <- build_phase_curves(dat, "NERMI_Motivation", n_grid = n_grid, roll_k = roll_k)
+
+
+subject_trajectory_plots <- list(
+  Valence = plot_subject_phase_trajectories(phase_val, "Valence", "Valence value"),
+  Motivation = plot_subject_phase_trajectories(phase_mot, "Motivation", "Motivation value")
+)
+
+
+subject_trajectory_plot_files <- imap_chr(
+  subject_trajectory_plots,
+  ~ save_analysis_plot(
+    .x,
+    paste(.y, "subject trajectories", sep = "_"),
+    directory = descriptive_plot_dir,
+    width = 14,
+    height = 10
+  )
+)
+
+
+long_vm <- bind_rows(
+  make_long_phase_curve(phase_val, "Valence"),
+  make_long_phase_curve(phase_mot, "Motivation")
+) %>%
+  mutate(
+    condition = factor(condition, levels = c("Controlli", "Interventi")),
+    trial = factor(trial, levels = c("T0", "T1")),
+    phase = factor(phase, levels = phase_levels),
+    measure = factor(measure, levels = c("Valence", "Motivation")),
+    subj = factor(participant),
+    subj_visit = factor(paste(participant, trial, sep = "__")),
+    subj_visit_phase = factor(paste(participant, trial, phase, sep = "__")),
+    curve_group = interaction(measure, condition, trial, phase, drop = TRUE)
+  ) %>%
+  filter(is.finite(value), is.finite(time_norm))
+
+
+# =========================================================
+# ANALYSIS 01: JOINT GAMM
+# =========================================================
+full_gamm <- bam(
+  value ~ measure * condition * trial * phase +
+    s(time_norm, by = curve_group, bs = "cr", k = 6) +
+    s(subj, bs = "re") +
+    s(subj_visit, bs = "re") +
+    s(subj_visit_phase, bs = "re"),
+  data = long_vm,
+  method = "fREML",
+  discrete = TRUE
+)
+
+
+joint_gamm_output_file <- save_print_output("joint_gamm", {
+  cat("\n==== Joint GAMM ====\n")
+  print(summary(full_gamm))
+  print(anova(full_gamm))
+})
+
+
+message("Saved Joint GAMM output: ", joint_gamm_output_file)
+
+
+# =========================================================
+# ANALYSIS 02: FITTED TRAJECTORY PLOTS
+# =========================================================
+pred_grid <- build_prediction_grid(long_vm, n_time = 200)
+pred_grid$fit <- predict(full_gamm, newdata = pred_grid, type = "response")
+
+
+did_df <- build_did_curves(pred_grid)
+# Generate DiD confidence intervals directly; no source() or separate script needed.
+save_did_confidence_intervals(full_gamm, pred_grid, "nermi")
+within_condition_df <- build_within_condition_change(pred_grid)
+
+
+primary_trajectory_plots <- list(
+  fitted_trajectories = plot_fitted_trajectories(pred_grid),
+  difference_in_differences = plot_did_curves(did_df),
+  within_condition_change = plot_within_condition_change(within_condition_df)
+)
+
+
+primary_trajectory_plot_files <- imap_chr(
+  primary_trajectory_plots,
+  ~ save_analysis_plot(
+    .x,
+    paste("nermi", .y, sep = "_"),
+    directory = descriptive_plot_dir,
+    width = 11,
+    height = 7
+  )
+)
+
+
+print(primary_trajectory_plots$fitted_trajectories)
+print(primary_trajectory_plots$difference_in_differences)
+print(primary_trajectory_plots$within_condition_change)
+
+
+# =========================================================
+# ANALYSIS 03: CAPS-MODERATED GAMMS
+# =========================================================
+long_vm_caps <- long_vm %>%
+  left_join(clin %>% select(participant, condition, CAPS_change), by = c("participant", "condition")) %>%
+  filter(is.finite(CAPS_change)) %>%
+  mutate(
+    CAPS_c = as.numeric(scale(CAPS_change, center = TRUE, scale = FALSE)),
+    curve_group_caps = interaction(measure, trial, phase, drop = TRUE)
+  )
+
+
+caps_bin_breaks <- make_two_bin_breaks(long_vm_caps$CAPS_c)
+long_vm_caps <- long_vm_caps %>%
+  mutate(
+    CAPS_bin = cut(CAPS_c, breaks = caps_bin_breaks, include.lowest = TRUE),
+    caps_curve_group = interaction(curve_group_caps, CAPS_bin, drop = TRUE)
+  )
+
+
+message("CAPS model sample: ", n_distinct(long_vm_caps$participant), " participants.")
+
+
+caps_gamm_1 <- bam(
+  value ~
+    measure * condition * trial * phase +
+    CAPS_c * measure * trial * phase +
+    s(time_norm, by = curve_group, bs = "cr", k = 6) +
+    s(subj, bs = "re") +
+    s(subj_visit, bs = "re") +
+    s(subj_visit_phase, bs = "re"),
+  data = long_vm_caps,
+  method = "fREML",
+  discrete = TRUE
+)
+
+
+caps_gamm_2 <- bam(
+  value ~
+    measure * condition * trial * phase +
+    CAPS_c * measure * trial * phase +
+    s(time_norm, by = curve_group, bs = "cr", k = 6) +
+    s(time_norm, by = caps_curve_group, bs = "cr", k = 6) +
+    s(subj, bs = "re") +
+    s(subj_visit, bs = "re") +
+    s(subj_visit_phase, bs = "re"),
+  data = long_vm_caps,
+  method = "fREML",
+  discrete = TRUE
+)
+
+
+clinical_moderation_output_files <- tibble(
+  outcome = "CAPS_change",
+  outcome_label = "CAPS change",
+  model = c("GAMM 1", "GAMM 2"),
+  file = c(
+    save_print_output("CAPS_change_GAMM_1", {
+      cat("\n==== CAPS GAMM 1 ====\n")
+      print(summary(caps_gamm_1))
+      print(anova(caps_gamm_1))
+    }),
+    save_print_output("CAPS_change_GAMM_2", {
+      cat("\n==== CAPS GAMM 2 ====\n")
+      print(summary(caps_gamm_2))
+      print(anova(caps_gamm_2))
+    })
+  )
+)
+
+
+message("Saved CAPS GAMM outputs: ", paste(clinical_moderation_output_files$file, collapse = "; "))
+
+
+pred_grid_caps <- build_caps_prediction_grid(
+  long_vm_caps,
+  probs = c(0.25, 0.75),
+  n_time = 200,
+  bin_breaks = caps_bin_breaks
+)
+pred_grid_caps$fit <- predict(caps_gamm_2, newdata = pred_grid_caps, type = "response")
+
+
+caps_diff_df <- build_caps_difference_curves(pred_grid_caps)
+
+
+clinical_moderation_plots <- list(
+  CAPS_change = list(
+    fitted_trajectories = plot_caps_fitted_trajectories(pred_grid_caps),
+    difference_curves = plot_caps_difference_curves(caps_diff_df)
+  )
+)
+
+
+clinical_moderation_plot_files <- tibble(
+  outcome = "CAPS_change",
+  outcome_label = "CAPS change",
+  plot_type = c("fitted_trajectories", "difference_curves"),
+  file = c(
+    save_moderation_plot(
+      clinical_moderation_plots$CAPS_change$fitted_trajectories,
+      "CAPS_change",
+      "fitted_trajectories"
+    ),
+    save_moderation_plot(
+      clinical_moderation_plots$CAPS_change$difference_curves,
+      "CAPS_change",
+      "difference_curves"
+    )
+  )
+)
+
+
+print(clinical_moderation_plots$CAPS_change$fitted_trajectories)
+print(clinical_moderation_plots$CAPS_change$difference_curves)
+
+
+clinical_moderation_results <- set_names(
+  map2(
+    additional_change_targets$outcome,
+    additional_change_targets$label,
+    ~ fit_clinical_moderation(long_vm, clin, outcome_name = .x, outcome_label = .y)
+  ),
+  additional_change_targets$outcome
+)
+
+
+for(i in seq_len(nrow(additional_change_targets))){
+  outcome_name <- additional_change_targets$outcome[i]
+  outcome_label <- additional_change_targets$label[i]
+  res <- clinical_moderation_results[[outcome_name]]
+
+
+  message(outcome_label, " model sample: ", n_distinct(res$long_df$participant), " participants.")
+
+
+  gamm_1_output_file <- save_print_output(paste(outcome_name, "GAMM_1", sep = "_"), {
+    cat("\n==== ", outcome_label, " GAMM 1 ====\n", sep = "")
+    print(summary(res$gamm_1))
+    print(anova(res$gamm_1))
+  })
+
+
+  gamm_2_output_file <- save_print_output(paste(outcome_name, "GAMM_2", sep = "_"), {
+    cat("\n==== ", outcome_label, " GAMM 2 ====\n", sep = "")
+    print(summary(res$gamm_2))
+    print(anova(res$gamm_2))
+  })
+
+
+  new_output_files <- tibble(
+    outcome = outcome_name,
+    outcome_label = outcome_label,
+    model = c("GAMM 1", "GAMM 2"),
+    file = c(gamm_1_output_file, gamm_2_output_file)
+  )
+
+
+  clinical_moderation_output_files <- bind_rows(
+    clinical_moderation_output_files,
+    new_output_files
+  )
+
+
+  message(
+    "Saved ",
+    outcome_label,
+    " model outputs: ",
+    paste(new_output_files$file, collapse = "; ")
+  )
+
+
+  clinical_moderation_plots[[outcome_name]] <- list(
+    fitted_trajectories = plot_clinical_fitted_trajectories(res$pred_grid, outcome_label),
+    difference_curves = plot_clinical_difference_curves(res$diff_df, outcome_label)
+  )
+
+
+  new_plot_files <- tibble(
+    outcome = outcome_name,
+    outcome_label = outcome_label,
+    plot_type = c("fitted_trajectories", "difference_curves"),
+    file = c(
+      save_moderation_plot(
+        clinical_moderation_plots[[outcome_name]]$fitted_trajectories,
+        outcome_name,
+        "fitted_trajectories"
+      ),
+      save_moderation_plot(
+        clinical_moderation_plots[[outcome_name]]$difference_curves,
+        outcome_name,
+        "difference_curves"
+      )
+    )
+  )
+
+
+  clinical_moderation_plot_files <- bind_rows(
+    clinical_moderation_plot_files,
+    new_plot_files
+  )
+
+
+  message(
+    "Saved ",
+    outcome_label,
+    " plots: ",
+    paste(new_plot_files$file, collapse = "; ")
+  )
+}
+
+
+clinical_moderation_output_index_file <- save_print_output("clinical_moderation_output_files", {
+  print(clinical_moderation_output_files, n = Inf, width = Inf)
+})
+
+
+clinical_moderation_plot_index_file <- save_print_output("clinical_moderation_plot_files", {
+  print(clinical_moderation_plot_files, n = Inf, width = Inf)
+})
+
+
+message(
+  "Saved moderation output indexes: ",
+  clinical_moderation_output_index_file,
+  "; ",
+  clinical_moderation_plot_index_file
+)
+
+
+# =========================================================
+# ANALYSIS 04: mLFPCA FEATURE SCREENING, CAPS REGRESSION, AND RECONSTRUCTED CURVES
+# =========================================================
+mlfpca_val_oc1 <- run_multilevel_fpca_phase(phase_val, "Valence", "oc1")
+mlfpca_val_script <- run_multilevel_fpca_phase(phase_val, "Valence", "script")
+mlfpca_val_oc2 <- run_multilevel_fpca_phase(phase_val, "Valence", "oc2")
+
+
+mlfpca_mot_oc1 <- run_multilevel_fpca_phase(phase_mot, "Motivation", "oc1")
+mlfpca_mot_script <- run_multilevel_fpca_phase(phase_mot, "Motivation", "script")
+mlfpca_mot_oc2 <- run_multilevel_fpca_phase(phase_mot, "Motivation", "oc2")
+
+
+ml_list <- list(
+  mlfpca_val_oc1,
+  mlfpca_val_script,
+  mlfpca_val_oc2,
+  mlfpca_mot_oc1,
+  mlfpca_mot_script,
+  mlfpca_mot_oc2
+)
+
+
+score_tbl <- clin %>%
+  select(participant, condition, all_of(clinical_change_targets$outcome)) %>%
+  distinct()
+
+
+all_feature_dfs <- map(ml_list, "features")
+
+
+for(feat_df in all_feature_dfs){
+  score_tbl <- score_tbl %>%
+    full_join(feat_df, by = c("participant", "condition"))
+}
+
+
+score_tbl$condition <- factor(score_tbl$condition, levels = c("Controlli", "Interventi"))
+
+
+mlfpca_feature_table_file <- save_print_output("mlfpca_feature_table", {
+  cat("\n==== mLFPCA feature table ====\n")
+  print(score_tbl, n = Inf, width = Inf)
+})
+
+
+message("Saved mLFPCA feature table: ", mlfpca_feature_table_file)
+
+
+fpca_feature_cols <- setdiff(
+  names(score_tbl),
+  c("participant", "condition", clinical_change_targets$outcome)
+)
+
+
+fpca_screen <- fpca_assoc_screen(score_tbl, outcome = "CAPS_change", variables = fpca_feature_cols)
+
+
+fpca_clinical_change_results <- clinical_assoc_by_outcome(
+  score_tbl,
+  clinical_change_targets,
+  fpca_feature_cols
+)
+
+
+fpca_screen_output_file <- save_print_output("mlfpca_features_vs_CAPS", {
+  cat("\n==== mLFPCA features vs CAPS ====\n")
+  print(fpca_screen, n = Inf, width = Inf)
+})
+
+
+fpca_clinical_change_output_file <- save_print_output("mlfpca_features_vs_clinical_change_scores", {
+  cat("\n==== mLFPCA features vs clinical symptom change scores ====\n")
+  print(fpca_clinical_change_results, n = Inf, width = Inf)
+})
+
+
+message(
+  "Saved mLFPCA screening outputs: ",
+  fpca_screen_output_file,
+  "; ",
+  fpca_clinical_change_output_file
+)
+
+
+fpca_clinical_scatter_specs <- fpca_clinical_change_results %>%
+  filter(is.finite(p_value), p_value < 0.05) %>%
+  arrange(p_value)
+
+
+fpca_clinical_scatter_plots <- pmap(
+  fpca_clinical_scatter_specs,
+  function(outcome, outcome_label, variable, n, rho, p_value){
+    plot_individual_clinical_scatter(
+      score_tbl,
+      clinical_var = outcome,
+      feature_var = variable,
+      clinical_label = outcome_label,
+      feature_label = variable,
+      title_txt = paste(variable, "vs", outcome_label)
+    )
+  }
+)
+
+
+names(fpca_clinical_scatter_plots) <- pmap_chr(
+  fpca_clinical_scatter_specs,
+  function(outcome, outcome_label, variable, n, rho, p_value){
+    safe_plot_name("mlfpca_scatter", outcome, variable)
+  }
+)
+
+
+fpca_clinical_scatter_files <- imap_chr(
+  fpca_clinical_scatter_plots,
+  ~ save_analysis_plot(
+    .x,
+    .y,
+    directory = file.path(descriptive_plot_dir, "clinical_scatterplots"),
+    width = 7,
+    height = 5.5
+  )
+)
+
+
+mlfpca_clinical_change_models <- set_names(
+  map(clinical_change_targets$outcome, ~ fit_top_feature_model(
+    score_tbl,
+    fpca_clinical_change_results,
+    outcome_name = .x
+  )),
+  clinical_change_targets$outcome
+)
+
+
+top_feats <- mlfpca_clinical_change_models[["CAPS_change"]]$top_features
+m_caps_fpca <- mlfpca_clinical_change_models[["CAPS_change"]]$model
+
+
+mlfpca_regression_output_files <- map2_dfr(
+  clinical_change_targets$outcome,
+  clinical_change_targets$label,
+  function(outcome_name, outcome_label){
+    model_obj <- mlfpca_clinical_change_models[[outcome_name]]$model
+    output_file <- save_print_output(paste(outcome_name, "mlfpca_regression", sep = "_"), {
+      cat("\n==== ", outcome_label, " regression on top mLFPCA features ====\n", sep = "")
+
+
+      if(is.null(model_obj)){
+        cat("No usable mLFPCA features were available for regression.\n")
+      } else {
+        print(summary(model_obj))
+        print(anova(model_obj))
+      }
+    })
+
+
+    tibble(
+      outcome = outcome_name,
+      outcome_label = outcome_label,
+      file = output_file
+    )
+  }
+)
+
+
+mlfpca_regression_output_index_file <- save_print_output("mlfpca_regression_output_files", {
+  print(mlfpca_regression_output_files, n = Inf, width = Inf)
+})
+
+
+message(
+  "Saved mLFPCA regression outputs: ",
+  paste(mlfpca_regression_output_files$file, collapse = "; ")
+)
+
+
+fpca_reconstruction_data <- build_fpca_reconstruction_data(ml_list, which = "between", pcs = 1:2)
+fpca_reconstruction_plot <- plot_fpca_reconstruction_all(ml_list, which = "between", pcs = 1:2)
+
+
+if(!is.null(fpca_reconstruction_plot)){
+  fpca_reconstruction_plot_file <- save_analysis_plot(
+    fpca_reconstruction_plot,
+    "nermi_fpca_reconstruction_between",
+    directory = descriptive_plot_dir,
+    width = 12,
+    height = 7
+  )
+  print(fpca_reconstruction_plot)
+} else {
+  fpca_reconstruction_plot_file <- NA_character_
+}
+fpca_reconstruction_plot
+ggsave(
+  filename = "fpca_reconstruction.png",
+  plot = fpca_reconstruction_plot,
+  width = 12,
+  height = 7,
+  dpi = 300
+)
+
+
+}, envir=nermi)
+```
+
+
+```{r derived-objects, include=FALSE}
+bhi_clin_summary <- bhi$clinical_change_outcomes$summary
+
+
+bhi_clin_tests <- bhi$clinical_change_outcomes$tests %>%
+  mutate(p_value = fmt_p(p_value))
+
+
+bhi_phase_lmm_full <- phase_lmm_tbl(bhi$phase_model_results)
+bhi_phase_lmm_key <- bhi_phase_lmm_full %>%
+  filter(term %in% c("trial", "condition:trial:phase")) %>%
+  select(measure, summary, term, NumDF, DenDF, `F value`, `Pr(>F)`)
+
+
+bhi_transition_change_top <- bhi$transition_clinical_change_assoc %>%
+  arrange(outcome, p_value) %>%
+  group_by(outcome, outcome_label) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+
+bhi_phase_change_main <- bhi$phase_clinical_change_results %>%
+  arrange(outcome, p_value) %>%
+  group_by(outcome, outcome_label) %>%
+  slice_head(n = 12) %>%
+  ungroup()
+
+
+bhi_mlfpca_caps_main <- bhi$mlfpca_caps_results %>%
+  slice_head(n = 12)
+
+
+bhi_mlfpca_ies_main <- bhi$mlfpca_ies_results %>%
+  slice_head(n = 12)
+
+
+bhi_mlfpca_change_main <- bhi$mlfpca_clinical_change_results %>%
+  arrange(outcome, p_value) %>%
+  group_by(outcome, outcome_label) %>%
+  slice_head(n = 12) %>%
+  ungroup()
+
+
+nermi_full_gamm_param <- gam_param_tbl(nermi$full_gamm)
+nermi_full_gamm_smooth <- gam_smooth_tbl(nermi$full_gamm)
+nermi_caps_gamm_1_param <- gam_param_tbl(nermi$caps_gamm_1)
+nermi_caps_gamm_1_smooth <- gam_smooth_tbl(nermi$caps_gamm_1)
+nermi_caps_gamm_2_param <- gam_param_tbl(nermi$caps_gamm_2)
+nermi_caps_gamm_2_smooth <- gam_smooth_tbl(nermi$caps_gamm_2)
+
+
+nermi_fpca_caps_main <- nermi$fpca_screen %>%
+  slice_head(n = 12)
+
+
+nermi_fpca_clinical_change_main <- nermi$fpca_clinical_change_results %>%
+  arrange(outcome, p_value) %>%
+  group_by(outcome, outcome_label) %>%
+  slice_head(n = 12) %>%
+  ungroup()
+```
+
+
+# Part I. SAI and PAI Physiological Analysis
+
+
+This section documents the analyses conducted on the SAI and PAI physiological trajectories. The workflow proceeds from clinical outcome description to transition-feature summaries, phase-level mixed-effects models, phase-specific change-score analyses, and exploratory multilevel FPCA. Together, these analyses assess whether treatment effects are visible in scalar summaries, in phase-specific T1-T0 changes, and in latent modes of functional trajectory variation.
+
+
+## Clinical Outcomes
+
+
+Clinical improvement was summarized first in order to establish the behavioral context for the physiological analyses. CAPS change, IES-R total and subscale change, and STAI Y1/Y2 change were compared across conditions using descriptive summaries and between-group tests.
+
+
+```{r bhi-clin-summary}
+kable(
+  clean_tbl(bhi_clin_summary),
+  caption = "Clinical change summaries by condition."
+)
+```
+
+
+```{r bhi-clin-tests}
+kable(
+  bhi_clin_tests,
+  caption = "Group comparison tests for CAPS, IES-R, and STAI change outcomes."
+)
+```
+
+
+## Transition Feature Change Scores
+
+
+The transition-feature analysis reduces each subject's curves to interpretable scalar summaries of reactivity and recovery. These change scores are then tested in two ways: between-group comparisons for treatment effects, and clinical associations with CAPS, IES-R, and STAI symptom change.
+
+
+```{r bhi-transition-group}
+kable(
+  clean_tbl(bhi$transition_group_tests),
+  caption = "Group comparisons for the transition-feature change scores."
+)
+```
+
+
+```{r bhi-transition-clinical}
+kable(
+  clean_tbl(bhi_transition_change_top),
+  caption = "Top transition-feature associations with clinical symptom change outcomes."
+)
+```
+
+
+```{r bhi-transition-scatterplots, fig.height=5, fig.width=7, fig.cap="Individual-level SAI/PAI transition-feature scatterplots for nominal clinical associations."}
+purrr::walk(head_list(bhi$transition_clinical_scatter_plots, 6), print)
+```
+
+
+## Phase Summary Mixed Models
+
+
+Phase-level mixed-effects models were then fit to the scalar phase summaries. For each measure and summary metric, the model evaluated the fixed effects of condition, trial, phase, and their interactions while accounting for repeated observations within participant.
+
+
+```{r bhi-phase-lmm-key}
+kable(
+  clean_tbl(bhi_phase_lmm_key),
+  caption = "Key fixed-effect tests from the phase-summary mixed models."
+)
+```
+
+
+## Phase-Specific Change Scores
+
+
+To localize treatment-related change more directly, phase-specific T1-T0 summary-score differences were computed for each phase. These change scores were screened against CAPS, IES-R, and STAI improvement to identify whether any specific phase carried the strongest symptom-linked physiological signal.
+
+
+```{r bhi-phase-clinical}
+kable(
+  clean_tbl(bhi_phase_change_main),
+  caption = "Top phase-specific summary-feature associations with clinical symptom change outcomes."
+)
+```
+
+
+## Observed Subject-Level Trajectories
+
+
+The following observed-data plots mirror the example trajectory figure using the actual participant curves. Each variable is shown as a 12-panel figure: TAU versus EMDR, T0 versus T1, and the three phases. Thin lines are individual participants and thick lines are group means.
+
+
+```{r bhi-sai-subject-trajectories, fig.height=8.5, fig.width=12, fig.cap="Observed SAI subject-level trajectories by group, visit, and phase."}
+print(bhi$subject_trajectory_plots$SAI)
+```
+
+
+```{r bhi-pai-subject-trajectories, fig.height=8.5, fig.width=12, fig.cap="Observed PAI subject-level trajectories by group, visit, and phase."}
+print(bhi$subject_trajectory_plots$PAI)
+```
+
+
+## Phase-Separated T1 minus T0 Curves
+
+
+The phase-separated change-curve figures display the mean T1-T0 trajectory within each phase and condition. These plots are intended as descriptive functional summaries rather than inferential tests.
+
+
+```{r bhi-sai-phase-curves, fig.height=4.5, fig.width=8.5, fig.cap="SAI phase-separated T1 minus T0 curves by condition."}
+print(bhi$phase_change_plots$SAI)
+```
+
+
+```{r bhi-pai-phase-curves, fig.height=4.5, fig.width=8.5, fig.cap="PAI phase-separated T1 minus T0 curves by condition."}
+print(bhi$phase_change_plots$PAI)
+```
+
+
+## Phase-Wise mLFPCA
+
+
+An exploratory multilevel functional principal component analysis was applied to the phase-separated SAI and PAI curves. Within each phase, the decomposition separated between-subject variation from within-subject visit-related variation. The resulting component scores were screened against CAPS, IES-R, and STAI change outcomes, while the baseline IES table is retained for continuity with the earlier draft. The strongest CAPS-related features were then entered into a regression model adjusted for condition. The final figure displays reconstructed between-subject FPCA modes for the leading principal components.
+
+
+```{r bhi-mlfpca-clinical-change}
+kable(
+  clean_tbl(bhi_mlfpca_change_main),
+  caption = "Top SAI/PAI mLFPCA feature associations with clinical symptom change outcomes."
+)
+```
+
+
+```{r bhi-mlfpca-scatterplots, fig.height=5, fig.width=7, fig.cap="Individual-level SAI/PAI mLFPCA scatterplots for nominal clinical associations."}
+purrr::walk(bhi$mlfpca_clinical_scatter_plots, print)
+```
+
+
+```{r bhi-mlfpca-caps}
+kable(
+  clean_tbl(bhi_mlfpca_caps_main),
+  caption = "Top SAI/PAI mLFPCA feature associations with CAPS change."
+)
+```
+
+
+```{r bhi-mlfpca-ies}
+kable(
+  clean_tbl(bhi_mlfpca_ies_main),
+  caption = "Top SAI/PAI mLFPCA feature associations with IES at baseline."
+)
+```
+
+
+```{r bhi-mlfpca-regression-coef}
+if(!is.null(bhi$m_caps_mlfpca)){
+  print(kable(
+    clean_tbl(lm_coef_tbl(bhi$m_caps_mlfpca)),
+    caption = "Linear model predicting CAPS change from condition and top SAI/PAI mLFPCA features."
+  ))
+}
+```
+
+
+```{r bhi-mlfpca-regression-anova}
+if(!is.null(bhi$m_caps_mlfpca)){
+  print(kable(
+    clean_tbl(lm_anova_tbl(bhi$m_caps_mlfpca)),
+    caption = "Analysis of variance table for the SAI/PAI mLFPCA CAPS regression."
+  ))
+}
+```
+
+
+```{r bhi-mlfpca-reconstruction, fig.height=7, fig.width=11, fig.cap="Reconstructed between-subject FPCA curves for the SAI/PAI analysis."}
+if(!is.null(bhi$fpca_reconstruction_plot)){
+  print(bhi$fpca_reconstruction_plot)
+}
+```
+
+
+# Part II. NerMI Valence and Motivation Analysis
+
+
+This section documents the analyses conducted on the NerMI Valence and Motivation trajectories. The analytic plan combines hierarchical generalized additive modeling, fitted-trajectory visualization, CAPS-moderation analyses, and exploratory multilevel FPCA in order to characterize both mean functional structure and latent variation in the time-normalized phase trajectories.
+
+
+## Observed Subject-Level Trajectories
+
+
+The following observed-data plots use the same 12-panel structure as the SAI/PAI figures: TAU versus EMDR, T0 versus T1, and the three phases. Separate plots are shown for Valence and Motivation.
+
+
+```{r nermi-valence-subject-trajectories, fig.height=8.5, fig.width=12, fig.cap="Observed NerMI Valence subject-level trajectories by group, visit, and phase."}
+print(nermi$subject_trajectory_plots$Valence)
+```
+
+
+```{r nermi-motivation-subject-trajectories, fig.height=8.5, fig.width=12, fig.cap="Observed NerMI Motivation subject-level trajectories by group, visit, and phase."}
+print(nermi$subject_trajectory_plots$Motivation)
+```
+
+
+## Joint GAMM
+
+
+The primary NerMI model was a joint GAMM for Valence and Motivation. This model estimated condition-, trial-, and phase-specific functional effects across normalized within-phase time while accommodating the repeated hierarchical structure of subject, visit, and visit-by-phase observations.
+
+
+```{r nermi-full-gamm-param}
+kable(
+  clean_tbl(nermi_full_gamm_param),
+  caption = "Parametric coefficient table for the joint NerMI GAMM."
+)
+```
+
+
+```{r nermi-full-gamm-smooth}
+kable(
+  clean_tbl(nermi_full_gamm_smooth),
+  caption = "Smooth-term table for the joint NerMI GAMM."
+)
+```
+
+
+## Fitted Trajectory Figures
+
+
+The fitted-trajectory figures visualize the estimated curves from the joint GAMM. They include the fitted profiles themselves, a difference-in-differences functional contrast, and within-condition T1-T0 change curves.
+
+
+```{r nermi-fitted-trajectories, fig.height=6, fig.width=10, fig.cap="Fitted NerMI trajectories by measure, phase, condition, and visit."}
+print(nermi$plot_fitted_trajectories(nermi$pred_grid))
+```
+
+
+```{r nermi-did-curves, fig.height=6, fig.width=10, fig.cap="Difference-in-differences curves for the NerMI trajectories."}
+print(nermi$plot_did_curves(nermi$did_df))
+```
+
+
+```{r nermi-within-condition, fig.height=6, fig.width=10, fig.cap="Within-condition T1 minus T0 change curves for the NerMI trajectories."}
+print(nermi$plot_within_condition_change(nermi$within_condition_df))
+```
+
+
+## CAPS-Moderated GAMMs
+
+
+The CAPS-moderated GAMMs extend the primary NerMI model by introducing CAPS improvement as a moderator. These models test whether the shape of the Valence and Motivation trajectories varies as a function of clinical change, both through parametric interactions and through CAPS-stratified smooth terms.
+
+
+```{r nermi-caps-gamm-1-param}
+kable(
+  clean_tbl(nermi_caps_gamm_1_param),
+  caption = "Parametric coefficient table for CAPS GAMM 1."
+)
+```
+
+
+```{r nermi-caps-gamm-1-smooth}
+kable(
+  clean_tbl(nermi_caps_gamm_1_smooth),
+  caption = "Smooth-term table for CAPS GAMM 1."
+)
+```
+
+
+```{r nermi-caps-gamm-2-param}
+kable(
+  clean_tbl(nermi_caps_gamm_2_param),
+  caption = "Parametric coefficient table for CAPS GAMM 2."
+)
+```
+
+
+```{r nermi-caps-gamm-2-smooth}
+kable(
+  clean_tbl(nermi_caps_gamm_2_smooth),
+  caption = "Smooth-term table for CAPS GAMM 2."
+)
+```
+
+
+```{r nermi-caps-fitted, fig.height=6.5, fig.width=10, fig.cap="Fitted NerMI trajectories stratified by CAPS improvement."}
+print(nermi$plot_caps_fitted_trajectories(nermi$pred_grid_caps))
+```
+
+
+```{r nermi-caps-diff, fig.height=6, fig.width=10, fig.cap="Difference curves between more-improved and less-improved CAPS strata."}
+print(nermi$plot_caps_difference_curves(nermi$caps_diff_df))
+```
+
+
+## NerMI mLFPCA
+
+
+An exploratory multilevel FPCA was also performed on the phase-specific NerMI curves. As in the physiological analysis, the decomposition produced between-subject and within-subject visit-related component features. These FPCA scores were screened for association with CAPS change, the strongest features were entered into a condition-adjusted regression model, and reconstructed between-subject component curves were plotted for interpretation.
+
+
+```{r nermi-mlfpca-screen}
+kable(
+  clean_tbl(nermi_fpca_caps_main),
+  caption = "Top NerMI mLFPCA feature associations with CAPS change."
+)
+```
+
+
+```{r nermi-mlfpca-clinical-change-screen}
+kable(
+  clean_tbl(nermi_fpca_clinical_change_main),
+  caption = "Top NerMI mLFPCA feature associations with clinical symptom change outcomes."
+)
+```
+
+
+```{r nermi-mlfpca-scatterplots, fig.height=5, fig.width=7, fig.cap="Individual-level NerMI mLFPCA scatterplots for nominal clinical associations."}
+purrr::walk(head_list(nermi$fpca_clinical_scatter_plots, 6), print)
+```
+
+
+```{r nermi-mlfpca-regression-coef}
+if(!is.null(nermi$m_caps_fpca)){
+  print(kable(
+    clean_tbl(lm_coef_tbl(nermi$m_caps_fpca)),
+    caption = "Linear model predicting CAPS change from condition and top NerMI mLFPCA features."
+  ))
+}
+```
+
+
+```{r nermi-mlfpca-regression-anova}
+if(!is.null(nermi$m_caps_fpca)){
+  print(kable(
+    clean_tbl(lm_anova_tbl(nermi$m_caps_fpca)),
+    caption = "Analysis of variance table for the NerMI mLFPCA CAPS regression."
+  ))
+}
+```
+
+
+```{r nermi-mlfpca-reconstruction, fig.height=7, fig.width=11, fig.cap="Reconstructed between-subject FPCA curves for the NerMI analysis."}
+if(!is.null(nermi$fpca_reconstruction_plot)){
+  print(nermi$fpca_reconstruction_plot)
+}
+```
+
+
+# Appendix
+
+
+The appendix provides the fuller model and screening tables that support the main sections above. These materials are intended as detailed documentation of the analyses rather than as a separate interpretive section.
+
+
+## Full SAI and PAI Phase Mixed-Model Table
+
+
+```{r bhi-phase-lmm-full}
+kable(
+  clean_tbl(bhi_phase_lmm_full),
+  caption = "Full fixed-effect table from the SAI/PAI phase-summary mixed models."
+)
+```
+
+
+## Full SAI and PAI mLFPCA Screens
+
+
+```{r bhi-mlfpca-caps-full}
+kable(
+  clean_tbl(bhi$mlfpca_caps_results),
+  caption = "Full SAI/PAI mLFPCA association table for CAPS change."
+)
+```
+
+
+```{r bhi-mlfpca-ies-full}
+kable(
+  clean_tbl(bhi$mlfpca_ies_results),
+  caption = "Full SAI/PAI mLFPCA association table for IES at baseline."
+)
+```
+
+
+## Full NerMI mLFPCA Screen
+
+
+```{r nermi-mlfpca-full}
+kable(
+  clean_tbl(nermi$fpca_screen),
+  caption = "Full NerMI mLFPCA association table for CAPS change."
+)
+```
+
+
+
+
+# Manuscript reporting additions
+
+
+## Table 1 and analytic sample
+
+
+Table 1 describes the clinical change sample (EMDR n = 11, TAU n = 15), which is distinct from the 27-participant primary physiological GAMM sample. Category descriptions from the clinical codebook remain to be verified.
+
+
+```{r manuscript-table1}
+table1 <- data.frame(
+ Characteristic=c("Age, years", "Baseline CAPS-5", "Baseline IES-R", "Cancer recurrence (coded 1), n (%)"),
+ EMDR=c("57.36 (7.20)","34.00 (10.84)","49.27 (15.79)","3 (27.3)"),
+ TAU=c("48.40 (9.42)","33.13 (10.63)","53.27 (13.57)","1 (6.7)"))
+knitr::kable(table1, caption="Baseline characteristics, clinical complete-case sample (n = 26). Continuous entries are M (SD).")
+```
+
+
+## Pointwise difference-in-differences confidence intervals
+
+
+For each of SAI, PAI, Valence, and Motivation, pointwise 95% confidence intervals were calculated for the DiD contrast (EMDR T1 - EMDR T0) - (TAU T1 - TAU T0) from the GAMM model matrix and coefficient covariance matrix. Random-effect smooths were excluded from population-level predictions. These are pointwise, not simultaneous, intervals.
+
+
+```{r manuscript-did-ci, results='asis'}
+for (measure in c("pai", "sai", "nermi")) {
+  file <- file.path("manuscript_gamm_ci", paste0(measure, "_did_ci.csv"))
+  if (!file.exists(file)) stop("Required GAMM CI file missing: ", file)
+  dat <- read.csv(file)
+  stopifnot(all(c("measure","phase","time_norm","DiD","se","lower95","upper95") %in% names(dat)))
+  print(knitr::kable(dplyr::summarise(dplyr::group_by(dat, measure, phase),
+   n_timepoints=dplyr::n(), below_zero=sum(upper95<0), above_zero=sum(lower95>0), .groups="drop"),
+   caption=paste(measure,"pointwise DiD intervals by phase")))
+  fig <- file.path("manuscript_gamm_ci", paste0(measure, "_did_ci.png"))
+  if(file.exists(fig)) print(knitr::include_graphics(fig))
+}
+```
+
+
+## Software session
+
+
+```{r software-environment}
+sessionInfo()
+```
