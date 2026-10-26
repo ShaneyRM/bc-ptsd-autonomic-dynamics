@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Analysis code: Autonomic Dynamics in Breast Cancer Patients with PTSD"
+type: software
+authors:
+  - family-names: Cotardo
+    given-names: Francesca
+  - family-names: McClafferty
+    given-names: Shane R.
+  - family-names: Chai
+    given-names: Xinzhu
+  - family-names: Ostacoli
+    given-names: Luca
+  - family-names: Carletto
+    given-names: Sara
+  - family-names: Friedman
+    given-names: Bruce H.
+license: PolyForm-Noncommercial-1.0.0
+repository-code: "https://github.com/ShaneyRM/bc-ptsd-autonomic-dynamics"

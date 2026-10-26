@@ -6,6 +6,10 @@
 
 This repository contains analysis code for the study. Results and publication figures are omitted pending acceptance. It does not contain participant-level data or the clinical source spreadsheets.
 
+## Citing this repository
+
+Use the metadata in [`CITATION.cff`](CITATION.cff) when citing this software.
+
 ## License
 
 This repository is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). The license permits use for noncommercial purposes and includes only the patent license stated in its terms. Commercial use is not permitted under this license.
@@ -60,11 +64,14 @@ Statistical results and figures are omitted pending acceptance.
 
 NerMI (valence, motivation, and activation) and SAI/PAI are distinct methods with different rights holders.
 
-- **NerMI:** Owned by McClafferty Innovations, LLC; associated U.S. patent application **19/227,299** is unpublished. The implementation is not included in this repository. To request licensing or analysis services, visit [nermi.info](https://nermi.info/) or email [srmcclafferty@gmail.com](mailto:srmcclafferty@gmail.com).
-- **SAI/PAI:** Covered by U.S. Patent **11,075,009 B2**. The third-party implementation and the repository authors' own implementation are not released here; non-commercial processing may be requested from the authors. An online SAI/PAI calculator is available at [saipai-hrv.com](https://www.saipai-hrv.com/index.html). Its site states that uploads are not encrypted and files may remain on the server between reboots; **do not upload identifiable, confidential, or otherwise sensitive participant data.** Review the site's [disclaimer](https://www.saipai-hrv.com/disclaimer.txt) and the rights holder's terms before use.
+- **NerMI:** Owned by McClafferty Innovations, LLC; associated U.S. patent application **19/227,299** is unpublished. The implementation is not included in this repository. For background on the dynamic-architecture method and its initial validation, see the [associated article](https://doi.org/10.1111/psyp.70359) and the [Dynamic Architecture Experiment repository](https://github.com/ShaneyRM/dynamic-architecture-experiment). The experiment repository describes its collection and processing pipeline; it does not contain the code that estimates the article's models or implements the real-time monitoring system. To request NerMI licensing or analysis services, visit [nermi.info](https://nermi.info/) or email [srmcclafferty@gmail.com](mailto:srmcclafferty@gmail.com).
+- **SAI/PAI:** The indices used here follow the SAI/PAI formulation described by Nardelli et al. (2023; see [reference](#references)). They are covered by U.S. Patent **11,075,009 B2**. The third-party implementation and the repository authors' own implementation are not released here; non-commercial processing may be requested from the authors. An online SAI/PAI calculator is available at [saipai-hrv.com](https://www.saipai-hrv.com/index.html). Its site states that uploads are not encrypted and files may remain on the server between reboots; **do not upload identifiable, confidential, or otherwise sensitive participant data.** Review the site's [disclaimer](https://www.saipai-hrv.com/disclaimer.txt) and the rights holder's terms before use.
 
 The implementations of NerMI and SAI/PAI are not included in this repository. This repository is licensed under the terms in [`LICENSE`](LICENSE); those terms govern any patent license for the software they cover. Contact the respective rights holders for permissions to use implementations or services that are not included here.
 
-## Reference
+## References
 
-Lin, W., Zou, J., Di, C., Rock, C. L., & Natarajan, L. (2024). Multilevel longitudinal functional principal component model. *Statistics in Medicine, 43*(25), 4781-4795. https://doi.org/10.1002/sim.10207
+- Lin, W., Zou, J., Di, C., Rock, C. L., & Natarajan, L. (2024). Multilevel longitudinal functional principal component model. *Statistics in Medicine, 43*(25), 4781-4795. https://doi.org/10.1002/sim.10207
+- McClafferty, S. R. (n.d.). *Dynamic Architecture Experiment* [Software repository]. GitHub. https://github.com/ShaneyRM/dynamic-architecture-experiment
+- McClafferty, S. R., & Friedman, B. H. (2026). A Dynamic Architecture Linking Autonomic Activity to Emotional Dimensions: Real-Time Estimation From Photoplethysmography. *Psychophysiology, 63*(7). https://doi.org/10.1111/psyp.70359
+- Nardelli, M., Citi, L., Barbieri, R., & Valenza, G. (2023). Characterization of autonomic states by complex sympathetic and parasympathetic dynamics. *Physiological Measurement, 44*(3), 035004. https://doi.org/10.1088/1361-6579/acbc07
