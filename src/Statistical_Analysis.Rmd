@@ -4723,7 +4723,7 @@ kable(
 ## Table 1 and analytic sample
 
 
-Table 1 describes the clinical change sample (EMDR n = 11, TAU n = 15), which is distinct from the 27-participant primary physiological GAMM sample. Category descriptions from the clinical codebook remain to be verified.
+Table 1 describes the clinical change sample (EMDR n = 11, TAU n = 15), which is distinct from the 27-participant primary physiological GAMM sample.
 
 
 ```{r manuscript-table1}
