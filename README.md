@@ -2,7 +2,6 @@
 
 **Study:** *Autonomic Dynamics in Breast Cancer Patients with PTSD Using Sympathetic and Parasympathetic Activity Indices and Emotional Dimensions*  
 **Authors:** Francesca Cotardo, Shane R. McClafferty, Xinzhu Chai, Luca Ostacoli, Sara Carletto, and Bruce H. Friedman  
-**Affiliation:** Department of Clinical and Biological Sciences, University of Turin, Italy
 
 This repository contains analysis code for the study. Results and publication figures are omitted pending acceptance. It does not contain participant-level data or the clinical source spreadsheets.
 
